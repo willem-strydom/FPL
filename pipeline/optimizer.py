@@ -50,6 +50,81 @@ TRANSFER_HARD_COST = 4.0
 SOFT_PENALTY_AT_ONE = -1.5
 SOFT_PENALTY_FREE_TRANSFERS_ANCHOR = 5
 
+# --- Bench value ---
+# A bench player only ever scores real points via FPL's auto-substitution
+# rule: a STARTER who gets exactly 0 minutes (not just a bad game) gets
+# swapped for the highest-priority bench player who (a) actually played and
+# (b) keeps the resulting formation legal. So a bench slot's expected value
+# is roughly P(this slot actually gets used) x that player's own quality —
+# never the flat "0.5 min * predicted_points" you might guess from just
+# reading the objective term below.
+#
+# BENCH_STARTER_BLANK_RATE is measured directly, not assumed: among rows in
+# the 25-26 archive where a player had started literally every one of their
+# last 5 games (trail_starts5 == 1.0 — about as "nailed on" as this pipeline
+# can call anyone), 7.6% of them still had a genuine 0-minute week right
+# after (injury, red card, unexpected rest). That's the single-player base
+# rate everything else here is built from.
+#
+# From that rate, the *unrestricted* probability that at least 1/2/3 of an
+# 11-man starting XI blank in a given week (treating starters as roughly
+# independent, binomial(11, 0.076)) comes out to 58% / 20% / 4.6% — but a
+# bench slot can only legally cover a blank in roughly its own position
+# group, not any of the 11, which cuts those figures down a lot (a rough
+# "~4 players typically share a given outfield position in the XI" discount
+# brings 58/20/4.6 down to ~14/5/~1) — landing almost exactly on a plain,
+# hand-picked 12%/5%/2% guess for bench ranks 1/2/3. Good enough agreement
+# that there's no real case for a fancier position-and-formation-exact
+# model here — see BENCH_RANK_WEIGHTS below for what's actually used and
+# why the three ranks get collapsed to one shared weight in the objective.
+BENCH_STARTER_BLANK_RATE = 0.076
+
+# The reserve keeper has no rank ambiguity — a squad always carries exactly
+# one bench keeper, and they only ever cover the single starting keeper
+# blanking — so this uses a measured single-event rate directly rather than
+# a rank-decayed guess. NOT the same BENCH_STARTER_BLANK_RATE as above,
+# though — that pooled rate is dominated by outfielders, who really do get
+# rotated/rested/tactically benched in a way keepers essentially never are
+# mid-season. Measured for GKs specifically instead, split by time of
+# season since that turned out to matter a lot: 11.1% in the GW30-38
+# run-in (dead-rubber rest once safety/relegation is settled) vs. 4.4% (±2%
+# at 95% CI, n=436) in GW1-29 in-season play — the number that actually
+# describes the gameweeks this pipeline ever predicts for, since it never
+# runs against a genuinely dead rubber. Still not "basically 0": real if
+# rare events (an untelegraphed injury, a red card, an illness) do show up
+# ~1 in 23 reliable-starter-keeper weeks even in-season.
+#
+# Worth being precise about what this is actually measuring: bench value
+# only matters for blanks you had no chance to react to — a foreseeable one
+# (an announced injury, a suspension from a prior red card) should really
+# be handled by a transfer, not bench depth, and counting it here overstates
+# the bench's true insurance value. Checked for this directly rather than
+# assuming it doesn't matter: of the 19 GK blank events behind the 4.4%
+# figure, zero were preceded by a red card in their prior match, and their
+# transfers_out-as-%-of-ownership at the origin week (a proxy for "had the
+# news already broken by the deadline") looks statistically indistinguishable
+# from non-blanking reliable-starter GKs at the same time (medians 4.4% vs
+# 3.1%, no outlier spike). Neither available signal found a meaningful
+# foreseeable component to strip out, so this stays at the raw measured
+# rate — but the historical archive has no preserved injury-status field to
+# check directly, and n=19 is thin, so "found nothing to subtract" is not
+# strong evidence that nothing should be subtracted. Revisit if a better
+# data source for this ever becomes available.
+BENCH_GK_WEIGHT = 0.044
+
+# Bench ranks 1/2/3 (outfield): the *identity* of which selected bench
+# player ends up ranked 1st/2nd/3rd (i.e. which one the auto-sub algorithm
+# tries first) depends on which players get selected — not knowable before
+# the solve — so assigning these three weights to specific candidates would
+# need real sorting/assignment machinery inside the MILP for a small
+# correction term that doesn't warrant it. Using the plain average of the
+# three ranks on every outfield bench slot is the correct expected-value
+# treatment when the rank-to-player assignment isn't resolved: unbiased in
+# aggregate, at the cost of not rewarding a specific bench slot for being
+# "the good one" over the other two.
+BENCH_RANK_WEIGHTS = (0.12, 0.05, 0.02)
+BENCH_OUTFIELD_WEIGHT = sum(BENCH_RANK_WEIGHTS) / len(BENCH_RANK_WEIGHTS)
+
 
 def soft_transfer_penalty_rate(free_transfers: int) -> float:
     free_transfers = max(0, min(SOFT_PENALTY_FREE_TRANSFERS_ANCHOR, free_transfers))
@@ -69,6 +144,57 @@ def load_squad_rules() -> dict:
         "min_play": positions["squad_min_play"].astype(int).to_dict(),
         "max_play": positions["squad_max_play"].astype(int).to_dict(),
     }
+
+
+def check_transfer_timing(pool: pd.DataFrame, out_code: int, in_code: int, n_near_term_weeks: int = 2) -> dict:
+    """Does this specific OUT/IN swap actually hold up on the *immediate*
+    fixture(s), or does it only win because of the full discounted-horizon
+    aggregate select_squad optimized over?
+
+    Motivating case (see conversation): a player can have a genuinely great
+    next fixture but a rough run after it — the aggregate correctly
+    recommends moving on from them for the *horizon*, but that can silently
+    paper over the fact that keeping them one more week, then transferring
+    later, would have captured that good fixture too. This doesn't change
+    what select_squad recommends (that would require a real multi-period,
+    multi-week transfer-timing optimization, which — deliberately — this
+    project isn't building: every week gets re-run fresh with new data
+    anyway, so planning several weeks of transfers in advance mostly
+    duplicates work next week's run will redo better). It just surfaces the
+    near-term picture explicitly so a transfer that only wins "on average
+    over 4 weeks" doesn't get treated the same as one that wins every week.
+    """
+    out_row = pool.loc[pool["code"] == out_code].iloc[0]
+    in_row = pool.loc[pool["code"] == in_code].iloc[0]
+    gw_cols = sorted(c for c in pool.columns if c.startswith("predicted_points_gw"))
+    near_cols = gw_cols[:n_near_term_weeks]
+
+    out_gw1, in_gw1 = float(out_row[gw_cols[0]]), float(in_row[gw_cols[0]])
+    out_near, in_near = float(out_row[near_cols].sum()), float(in_row[near_cols].sum())
+
+    return {
+        "out_player": out_row["web_name"], "in_player": in_row["web_name"],
+        "out_gw1": out_gw1, "in_gw1": in_gw1, "gw1_favors_keeping": out_gw1 > in_gw1,
+        "out_near_term": out_near, "in_near_term": in_near, "near_term_favors_keeping": out_near > in_near,
+        "out_full_aggregate": float(out_row["predicted_points"]), "in_full_aggregate": float(in_row["predicted_points"]),
+    }
+
+
+def analyze_transfer_timing(pool: pd.DataFrame, transferred_out: pd.DataFrame, transferred_in: pd.DataFrame) -> list[dict]:
+    """Run check_transfer_timing on every suggested swap, pairing OUT/IN by
+    position (sorted by predicted_points so multiple same-position swaps
+    pair sensibly rather than arbitrarily)."""
+    results = []
+    for pos in transferred_out["position_name"].unique():
+        outs_pos = transferred_out[transferred_out["position_name"] == pos].sort_values(
+            "predicted_points", ascending=False
+        )
+        ins_pos = transferred_in[transferred_in["position_name"] == pos].sort_values(
+            "predicted_points", ascending=False
+        )
+        for out_code, in_code in zip(outs_pos["code"], ins_pos["code"]):
+            results.append(check_transfer_timing(pool, out_code, in_code))
+    return results
 
 
 def select_squad(
@@ -100,18 +226,20 @@ def select_squad(
     # captain's points count twice: once as a starter, once again as captain
     objective = pulp.lpSum((starter[i] + captain[i]) * pred[i] for i in idx)
 
-    # Bench players contribute nothing to the primary objective (design
-    # doc's EV-maximization is about the starting XI), which leaves the
-    # solver genuinely indifferent among same-priced bench options — it
-    # will happily seat a mediocre bench forward next to a much better one
-    # at the identical price, since nothing in the objective says
-    # otherwise, and CBC returns *a* vertex, not "the" vertex, among tied
-    # solutions. A small epsilon reward for bench predicted_points breaks
-    # that tie in favor of the better bench player without ever being
-    # large enough to justify a worse starting XI to get it — it's sized
-    # far below the smallest realistic single-player starting-XI swing.
-    BENCH_EPSILON = 1e-3
-    objective += BENCH_EPSILON * pulp.lpSum((squad[i] - starter[i]) * pred[i] for i in idx)
+    # Bench players get a real expected-value term now, not just a tie-break
+    # epsilon (see BENCH_STARTER_BLANK_RATE / BENCH_GK_WEIGHT /
+    # BENCH_OUTFIELD_WEIGHT above for where these numbers come from and why
+    # a bench player's true expected contribution is nowhere near their
+    # face-value predicted_points). Deliberately NOT capped to be "too small
+    # to affect the starting XI" the way the old placeholder was — a real
+    # bench player's value can legitimately be worth trading a marginal
+    # starting-XI swing for, and that's exactly the trade-off this term is
+    # meant to let the solver make.
+    is_gk = (pool["position_name"] == "GKP").values
+    bench_weight = pd.Series(
+        [BENCH_GK_WEIGHT if g else BENCH_OUTFIELD_WEIGHT for g in is_gk], index=pool.index
+    )
+    objective += pulp.lpSum((squad[i] - starter[i]) * pred[i] * bench_weight[i] for i in idx)
 
     transfers_used_expr = None
     if current_squad_codes is not None and free_transfers is not None:
@@ -177,6 +305,10 @@ def select_squad(
         excess_n = max(0, n_transfers - free_transfers)
         soft_cost = soft_transfer_penalty_rate(free_transfers) * n_transfers
         hard_cost = TRANSFER_HARD_COST * excess_n
+        transferred_in = squad_df[~squad_df["code"].isin(current_squad_codes)]
+        transferred_out = pool[
+            pool["code"].isin(current_squad_codes) & ~pool["code"].isin(squad_df["code"])
+        ]
         transfer_info = {
             "transfers_used": n_transfers,
             "free_transfers": free_transfers,
@@ -184,7 +316,8 @@ def select_squad(
             "soft_cost": float(soft_cost),
             "hard_cost": float(hard_cost),
             "total_transfer_cost": float(soft_cost + hard_cost),
-            "transferred_in": squad_df.loc[~squad_df["code"].isin(current_squad_codes), "web_name"].tolist(),
+            "transferred_in": transferred_in["web_name"].tolist(),
+            "timing_check": analyze_transfer_timing(pool, transferred_out, transferred_in),
         }
 
     logger.info(

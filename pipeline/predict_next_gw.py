@@ -109,19 +109,20 @@ def fit_floor_mae_optimal(full_df: pd.DataFrame, X_full: pd.DataFrame, glm60_res
 def _load_blended_player_log() -> pd.DataFrame:
     """Last season's full archive plus this season's games-so-far, one
     continuous per-player timeline tagged with a season_weight column so
-    _add_trailing_features (see pipeline/features.py) counts a current-
-    season game for CURRENT_SEASON_GAME_WEIGHT historical games' worth
-    inside the same fixed-size trailing window — real early-season evidence
-    moves the trailing read immediately instead of being diluted by however
-    many stale games still fill out the rest of the window. Never used for
-    GLM training (see _fit_production_models, which stays on the plain
-    unweighted 25-26 archive) — only for scoring the live candidate pool.
+    _add_trailing_features (see pipeline/features.py) weights a historical
+    game at HISTORICAL_SEASON_GAME_WEIGHT and a current-season game at
+    CURRENT_SEASON_GAME_WEIGHT inside the same fixed-size trailing window —
+    real early-season evidence moves the trailing read immediately instead
+    of being diluted by however many stale games still fill out the rest of
+    the window. Never used for GLM training (see _fit_production_models,
+    which stays on the plain unweighted 25-26 archive) — only for scoring
+    the live candidate pool.
     """
-    from pipeline.config import CURRENT_SEASON_GAME_WEIGHT
+    from pipeline.config import CURRENT_SEASON_GAME_WEIGHT, HISTORICAL_SEASON_GAME_WEIGHT
     from pipeline.fpl_current_season import build_current_season_table
 
     hist = load_processed("player_gameweek_2025_26").copy()
-    hist["season_weight"] = 1.0
+    hist["season_weight"] = HISTORICAL_SEASON_GAME_WEIGHT
     hist["kickoff_time"] = pd.to_datetime(hist["kickoff_time"])
 
     current = build_current_season_table()
@@ -154,8 +155,8 @@ def _load_blended_player_log() -> pd.DataFrame:
     current["element"] = current["code"]
 
     logger.info(
-        "blending %d current-season rows (weight=%.1f) with %d historical rows (weight=1.0)",
-        len(current), CURRENT_SEASON_GAME_WEIGHT, len(hist),
+        "blending %d current-season rows (weight=%.3f) with %d historical rows (weight=%.3f)",
+        len(current), CURRENT_SEASON_GAME_WEIGHT, len(hist), HISTORICAL_SEASON_GAME_WEIGHT,
     )
     return pd.concat([hist, current], ignore_index=True)
 
@@ -307,42 +308,45 @@ def fetch_lineup_data() -> tuple[pd.DataFrame, set]:
 
 
 def compute_p_plays_60(
-    pool: pd.DataFrame, use_lineups: bool = True, lineup_data: tuple | None = None
+    pool: pd.DataFrame, use_lineups: bool = True, lineup_data: tuple | None = None, trust_lineup: bool = True
 ) -> pd.DataFrame:
     """Start-probability blend, in priority order:
 
     1. RotoWire predicted/confirmed lineup, if the player's team has one
-       published — forward-looking, current-squad-aware information
-       (summer transfers, new signings, this week's fitness) that no
-       trailing stat can carry. Overrides the proxy outright rather than
-       averaging with it: a confirmed lineup and a stale minutes trend
-       aren't two votes of equal standing.
+       published AND `trust_lineup` is True — forward-looking, current-
+       squad-aware information (summer transfers, new signings, this
+       week's fitness) that no trailing stat can carry. Overrides the
+       proxy outright rather than averaging with it: a confirmed lineup
+       and a stale trend aren't two votes of equal standing.
     2. Team has a published lineup but this player isn't in the matched
        11 -> BENCH_PROB. This is what catches the Darlow case: he won't
        be in Man Utd's list at all once someone else is confirmed in
        goal, regardless of how many minutes he played last season
        elsewhere.
-    3. No lineup published yet for that team (or use_lineups=False) ->
-       fall back to the trailing 5-gameweek minutes proxy
-       (trail_minutes5 / 90).
+    3. No lineup published yet for that team, `use_lineups=False`, or
+       `trust_lineup=False` -> fall back to the trailing 5-gameweek
+       season-weighted STARTS fraction (trail_starts5, see features.py) —
+       not trailing minutes. Distinguishes a player who reliably plays a
+       full 90 from one who starts but is frequently subbed off early;
+       trailing minutes alone can't (both can show a similar average).
 
     RotoWire only ever publishes a lineup for the *next* upcoming
-    gameweek — there's no GW2-4 lineup to fetch. By default this carries
-    that one snapshot forward and applies it to whichever gameweek `pool`
-    represents: a confirmed/predicted role right now (nailed starter vs.
-    third-choice) is a read on the player's current standing at their
-    club, which is far more likely to still hold in 2-3 weeks than the
-    pre-season trailing-minutes trend it replaces (that trend is exactly
-    what produced the Darlow/Lammens failure mode in the first place).
-    It's a carry-forward assumption, not new information about GW2-4
-    specifically — pass lineup_data through from a single fetch (see
-    fetch_lineup_data) rather than re-fetching per horizon.
+    gameweek — there's no real GW2-4 lineup to fetch. `trust_lineup`
+    exists specifically so callers predicting horizon > 1 can say so:
+    passing trust_lineup=False for those calls means this function
+    doesn't apply the current week's lineup read to a week it was never
+    actually about — a real gap fixed after being diagnosed in
+    conversation (every confirmed starter got the same flat probability
+    for weeks 2-4 regardless of their own reliability pattern; a player
+    who's frequently subbed early got the same forward-carried number as
+    one who never leaves the pitch). Callers that still want the old
+    carry-forward behavior can pass trust_lineup=True for every horizon.
     """
-    trailing_p60 = (pool["trail_minutes5"] / 90).clip(0, 1)
+    trailing_p60 = pool["trail_starts5"].clip(0, 1)
     p60 = trailing_p60.copy()
-    source = pd.Series("trailing_minutes", index=pool.index)
+    source = pd.Series("trailing_starts", index=pool.index)
 
-    if not use_lineups:
+    if not use_lineups or not trust_lineup:
         pool = pool.copy()
         pool["p_plays_60"] = p60
         pool["p_plays_60_source"] = source
@@ -431,10 +435,17 @@ def predict_gw(
     # DesignDoc.md's formula is E[points] = P(60+min)*E[points|60+min] + ...,
     # with start probability explicitly "sourced from data directly ...
     # NOT modeled from scratch." See compute_p_plays_60 for the source
-    # priority (lineup data first, trailing minutes as fallback). `floor` is
+    # priority (lineup data first, trailing starts fraction as fallback). `floor` is
     # the MAE-optimal fitted constant for "doesn't get 60+ minutes" (see
     # fit_floor_mae_optimal) — replaces the old hardcoded FLOOR_POINTS=0.5.
-    pool = compute_p_plays_60(pool, use_lineups=use_lineups, lineup_data=lineup_data)
+    # RotoWire's fetched lineup only really speaks to the literal next
+    # gameweek — trust it as an override only for horizon==1; for horizon
+    # 2-4, compute_p_plays_60 falls back to trail_starts5 instead of
+    # blindly carrying the horizon-1 lineup read forward (see its
+    # docstring for the failure mode this fixes).
+    pool = compute_p_plays_60(
+        pool, use_lineups=use_lineups, lineup_data=lineup_data, trust_lineup=(horizon == 1)
+    )
     pool["predicted_points"] = (
         pool["p_plays_60"] * pool["quality_pred"] + (1 - pool["p_plays_60"]) * floor
     )

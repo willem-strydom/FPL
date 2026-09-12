@@ -125,6 +125,7 @@ def _add_trailing_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
 
     df["_w_minutes"] = df["minutes"] * df["season_weight"]
     df["_w_points"] = df["total_points"] * df["season_weight"]
+    df["_w_starts"] = df["starts"] * df["season_weight"]
 
     grp = df.groupby("element")
     roll_w = grp["season_weight"].transform(lambda s: s.rolling(window, min_periods=1).sum())
@@ -138,7 +139,15 @@ def _add_trailing_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
     # lately, no model at all. Inclusive of the current row (origin already
     # happened, so there's no leakage in using its own points).
     df["trail_points5"] = grp["_w_points"].transform(lambda s: s.rolling(window, min_periods=1).sum()) / roll_w
-    df = df.drop(columns=["_w_minutes", "_w_points"])
+    # Season-weighted fraction of the last 5 games actually started (not
+    # just "appeared in") — not a model feature, used only by
+    # predict_next_gw.compute_p_plays_60 as the fallback/future-week start-
+    # probability estimate, in place of trail_minutes5/90. Distinguishes a
+    # reliable 90-minute player from one who starts but is frequently
+    # subbed early (both can show similar trail_minutes5, but their `starts`
+    # record differs once you'd expect it to).
+    df["trail_starts5"] = grp["_w_starts"].transform(lambda s: s.rolling(window, min_periods=1).sum()) / roll_w
+    df = df.drop(columns=["_w_minutes", "_w_points", "_w_starts"])
 
     # Expanding (not rolling, not season-weighted) cumulative-to-date
     # counters: same leakage-safe convention as the rolling features above

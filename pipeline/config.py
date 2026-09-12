@@ -26,11 +26,18 @@ FPL_ELEMENT_SUMMARY_URL = f"{FPL_API_BASE}/element-summary/{{element_id}}/"
 # carries real gameweek-by-gameweek data for it (see pipeline/fpl_current_season.py)
 # — the trailing features can blend this in immediately rather than waiting
 # for a full rolling-5 window of real current-season games to accumulate.
-# CURRENT_SEASON_GAME_WEIGHT is how much more a current-season game counts
-# than a historical one inside that blended window (requested as "roughly
-# 3:2" — a plain per-game weight, not a shrinkage/reliability discount, and
-# applied only at live-inference time, never to historical training data).
-CURRENT_SEASON_GAME_WEIGHT = 1.5
+# Per-game weights inside that blended 5-game window (applied only at live-
+# inference time, never to historical training data). Explicit request as
+# of GW4 (3 real current-season games now exist, filling most of the
+# window): 1/2 per historical game, 4/3 per current-season game — for a
+# player with the now-typical 2 historical + 3 current-season split, that's
+# 2*(1/2) + 3*(4/3) = 1 + 4 = 5, i.e. still a 5-game-equivalent window in
+# total weight, just reallocated toward this season's real evidence rather
+# than uniformly. Previously a single CURRENT_SEASON_GAME_WEIGHT=1.5 with
+# historical implicitly at 1.0 (requested "roughly 3:2") — superseded here,
+# not additive with it.
+HISTORICAL_SEASON_GAME_WEIGHT = 1 / 2
+CURRENT_SEASON_GAME_WEIGHT = 4 / 3
 
 VAASTAV_BASE = (
     "https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data"
