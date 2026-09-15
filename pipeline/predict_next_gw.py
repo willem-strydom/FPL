@@ -107,58 +107,48 @@ def fit_floor_mae_optimal(full_df: pd.DataFrame, X_full: pd.DataFrame, glm60_res
 
 
 def _load_blended_player_log() -> pd.DataFrame:
-    """Last season's full archive plus this season's games-so-far, one
-    continuous per-player timeline tagged with a season_weight column so
-    _add_trailing_features (see pipeline/features.py) weights a historical
-    game at HISTORICAL_SEASON_GAME_WEIGHT and a current-season game at
-    CURRENT_SEASON_GAME_WEIGHT inside the same fixed-size trailing window —
-    real early-season evidence moves the trailing read immediately instead
-    of being diluted by however many stale games still fill out the rest of
-    the window. Never used for GLM training (see _fit_production_models,
+    """This season's games-so-far, one per-player timeline for
+    _add_trailing_features (see pipeline/features.py) to compute trailing
+    features from. Never used for GLM training (see _fit_production_models,
     which stays on the plain unweighted 25-26 archive) — only for scoring
     the live candidate pool.
-    """
-    from pipeline.config import CURRENT_SEASON_GAME_WEIGHT, HISTORICAL_SEASON_GAME_WEIGHT
-    from pipeline.fpl_current_season import build_current_season_table
 
-    hist = load_processed("player_gameweek_2025_26").copy()
-    hist["season_weight"] = HISTORICAL_SEASON_GAME_WEIGHT
-    hist["kickoff_time"] = pd.to_datetime(hist["kickoff_time"])
+    As of GW5 (4 real current-season games exist — enough to stop leaning
+    on last season's tail at all, per request): last season's archive is
+    excluded entirely rather than blended in at a reduced weight. Earlier
+    in the season this function did carry a HISTORICAL_SEASON_GAME_WEIGHT/
+    CURRENT_SEASON_GAME_WEIGHT blend (see pipeline/config.py, still defined
+    there in case an earlier point in a future season wants it again) — cut
+    now on the reasoning that once real current-season history fills the
+    5-game window, the old crutch adds nothing but noise. season_weight is
+    still set (uniformly) rather than dropped as a column: every downstream
+    weighted-average feature (trail_minutes5, trail_points5, trail_starts5,
+    the per-90 form rates) is scale-invariant to a uniform weight — verified
+    directly, not assumed — so the exact value here is inert as long as
+    it's the same for every row; only the historical/current *split* was
+    ever doing anything, and that split no longer exists.
+
+    `element` (FPL's numeric player id) still gets aliased to `code` even
+    though only one season is in play now — harmless, and keeps this
+    function's output shape consistent with what build_gw_feature_rows
+    already expects.
+    """
+    from pipeline.fpl_current_season import build_current_season_table
 
     current = build_current_season_table()
     if current.empty:
-        logger.info("no current-season games played yet — trailing features are pure last-season history")
-        return hist
+        raise RuntimeError(
+            "no current-season games played yet, and last season's archive is no longer "
+            "used as a fallback — re-enable the historical blend (see git history) if "
+            "scoring before real current-season data exists is ever needed again."
+        )
 
     current = current.copy()
-    current["season_weight"] = CURRENT_SEASON_GAME_WEIGHT
-    # `round` resets to 1 every season — naively concatenated, _origin_snapshot's
-    # (element, round) grouping would collide this season's round 1 with last
-    # season's, and picking "last known state" by max(round) would then wrongly
-    # prefer last season's round 38 over this season's round 2. Offsetting keeps
-    # round strictly increasing across the blended timeline (matching kickoff_time
-    # order) without touching how `round` is used anywhere else — this table's
-    # round numbers never get compared against the live target gameweek, only
-    # against each other for ordering.
-    current["round"] = current["round"] + hist["round"].max()
-
-    # `element` (FPL's numeric player id) gets REASSIGNED every season — it is
-    # NOT a valid grouping key across this concatenation (confirmed directly:
-    # live element=9 is Hincapié, but element=9 in the 25-26 archive is Jakub
-    # Kiwior — a completely different player). Every downstream function here
-    # (_add_trailing_features, _origin_snapshot) groups by "element", so for
-    # this blended table specifically, replace it with `code` — the one id
-    # that's genuinely stable across seasons — before anything groups on it.
-    # Safe to do: build_gw_feature_rows merges this table back onto the live
-    # pool by `code`, never by this internal `element` value.
-    hist["element"] = hist["code"]
+    current["season_weight"] = 1.0
     current["element"] = current["code"]
 
-    logger.info(
-        "blending %d current-season rows (weight=%.3f) with %d historical rows (weight=%.3f)",
-        len(current), CURRENT_SEASON_GAME_WEIGHT, len(hist), HISTORICAL_SEASON_GAME_WEIGHT,
-    )
-    return pd.concat([hist, current], ignore_index=True)
+    logger.info("live inference trailing features: %d current-season rows, no historical blend", len(current))
+    return current
 
 
 def graduated_new_arrivals(cold_start: pd.DataFrame) -> pd.Series:
@@ -355,9 +345,25 @@ def compute_p_plays_60(
     probs, teams_with_lineup = lineup_data if lineup_data is not None else fetch_lineup_data()
 
     if not probs.empty:
-        lineup_map = probs.set_index("code")["p_plays_60_lineup"]
-        has_lineup_entry = pool["code"].isin(lineup_map.index)
-        p60 = p60.where(~has_lineup_entry, pool["code"].map(lineup_map))
+        # RotoWire can carry more than one fixture per team at once — e.g. a
+        # postponed/rearranged earlier-gameweek match still to be played
+        # alongside the normal next-gameweek preview (hit directly: GW4 had
+        # an outstanding Leeds-Newcastle fixture live at the same time as
+        # GW5's real previews, giving Newcastle two lineup rows with two
+        # different opponents). `code` alone isn't a safe lookup key here.
+        # Disambiguate on the actual opponent this pool has the player
+        # facing for the gameweek being scored, not on RotoWire's own
+        # confirmed/predicted status label — "confirmed" means "more
+        # imminent," not "the gameweek we're scoring."
+        probs = probs.copy()
+        probs["opponent_norm"] = probs["opponent"].apply(normalize_team)
+        pool_opponent_norm = pool["opponent_name"].apply(normalize_team)
+        pool_key = pool["code"].astype(str) + "|" + pool_opponent_norm
+        probs["_key"] = probs["code"].astype(str) + "|" + probs["opponent_norm"]
+        lineup_map = probs.drop_duplicates(subset="_key").set_index("_key")["p_plays_60_lineup"]
+
+        has_lineup_entry = pool_key.isin(lineup_map.index)
+        p60 = p60.where(~has_lineup_entry, pool_key.map(lineup_map))
         source = source.where(~has_lineup_entry, "lineup_starter")
 
         team_has_lineup = pool["team_name"].apply(normalize_team).isin(teams_with_lineup)
