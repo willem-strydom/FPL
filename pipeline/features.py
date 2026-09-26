@@ -242,8 +242,9 @@ def build_horizon_table(
     min_origin_round: int = MIN_ORIGIN_ROUND,
     target_min_minutes: int = TARGET_MIN_MINUTES,
     target_max_minutes: int | None = None,
+    rolling_window: int = 5,
 ) -> pd.DataFrame:
-    df = _add_trailing_features(df)
+    df = _add_trailing_features(df, window=rolling_window)
 
     origin = _origin_snapshot(df)
     origin = origin[origin["round"] >= min_origin_round]

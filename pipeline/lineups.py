@@ -25,6 +25,7 @@ further out. Horizons 2+ still need the trailing-minutes fallback.
 """
 import logging
 import re
+from datetime import date
 
 import pandas as pd
 import requests
@@ -214,6 +215,16 @@ def ingest() -> pd.DataFrame:
     html = fetch_page()
     lineups_df = parse_lineups(html)
     save_raw(lineups_df, "rotowire_lineups_raw")
+    # `rotowire_lineups_raw` above gets overwritten on every fetch (save_raw
+    # has no versioning), so nothing about a past gameweek's lineup call
+    # survives to be checked against what actually happened. This dated
+    # snapshot is purely additive (never read by the live pipeline) so that
+    # a real RotoWire-vs-trailing-fallback accuracy comparison becomes
+    # possible once enough gameweeks have accumulated. Date-grained, not
+    # per-fetch: a lineup can flip from "predicted" to "confirmed" status
+    # intraday, but the daily snapshot closest to kickoff is what a real
+    # backtest would have had to work with anyway.
+    save_raw(lineups_df, f"rotowire_lineups_history_{date.today().isoformat()}")
     return lineups_df
 
 

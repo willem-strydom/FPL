@@ -202,6 +202,7 @@ def select_squad(
     rules: dict | None = None,
     current_squad_codes: set | None = None,
     free_transfers: int | None = None,
+    force_transfers: int | None = None,
 ) -> dict:
     """pool must have: code, web_name, team_name, position_name, price,
     predicted_points — one row per eligible candidate. Returns the
@@ -212,6 +213,15 @@ def select_squad(
     soft_transfer_penalty_rate) — pass both to re-optimize an existing
     squad; leave both None to build from scratch with no transfer cost at
     all, which is what an initial/opening squad actually costs in FPL.
+
+    force_transfers pins the transfer count to exactly this value instead
+    of letting the soft-cost curve trade it off freely — used to compute
+    V(t, k) (best achievable points spending exactly k transfers this
+    week) as an input to the transfer-banking value backtest, where the
+    outer DP over banked-transfer count needs each k's value in isolation,
+    not the single best k the smooth heuristic would pick on its own. Only
+    the real hard cost applies (transfers beyond free_transfers), no soft
+    penalty — the DP handles the banking trade-off at its own level.
     """
     rules = rules or load_squad_rules()
     pool = pool.reset_index(drop=True)
@@ -249,18 +259,27 @@ def select_squad(
         transfers_used_expr = pulp.lpSum(
             squad[i] for i in idx if not was_in_squad.iloc[i]
         )
-        soft_rate = soft_transfer_penalty_rate(free_transfers)
-        objective += soft_rate * transfers_used_expr
+        if force_transfers is not None:
+            prob += transfers_used_expr == force_transfers
+            hard_units = max(0, force_transfers - free_transfers)
+            objective -= TRANSFER_HARD_COST * hard_units
+            logger.info(
+                "transfer count forced to %d (%d free available) -> hard cost %.1f",
+                force_transfers, free_transfers, TRANSFER_HARD_COST * hard_units,
+            )
+        else:
+            soft_rate = soft_transfer_penalty_rate(free_transfers)
+            objective += soft_rate * transfers_used_expr
 
-        excess = pulp.LpVariable("excess_transfers", lowBound=0)
-        prob += excess >= transfers_used_expr - free_transfers
-        objective -= TRANSFER_HARD_COST * excess
+            excess = pulp.LpVariable("excess_transfers", lowBound=0)
+            prob += excess >= transfers_used_expr - free_transfers
+            objective -= TRANSFER_HARD_COST * excess
 
-        logger.info(
-            "transfer penalty active: %d free transfers -> soft rate %.3f/transfer, "
-            "hard cost %.1f/transfer beyond the free allowance",
-            free_transfers, soft_rate, TRANSFER_HARD_COST,
-        )
+            logger.info(
+                "transfer penalty active: %d free transfers -> soft rate %.3f/transfer, "
+                "hard cost %.1f/transfer beyond the free allowance",
+                free_transfers, soft_rate, TRANSFER_HARD_COST,
+            )
 
     prob += objective, "expected_points_net_of_transfer_cost"
 

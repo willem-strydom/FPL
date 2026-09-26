@@ -18,8 +18,10 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 import statsmodels.discrete.discrete_model as dm
+from sklearn.linear_model import LogisticRegression
 
 from pipeline.features import (
+    MIN_ORIGIN_ROUND,
     POSITION_COLUMN,
     _add_trailing_features,
     _origin_snapshot,
@@ -298,7 +300,8 @@ def fetch_lineup_data() -> tuple[pd.DataFrame, set]:
 
 
 def compute_p_plays_60(
-    pool: pd.DataFrame, use_lineups: bool = True, lineup_data: tuple | None = None, trust_lineup: bool = True
+    pool: pd.DataFrame, use_lineups: bool = True, lineup_data: tuple | None = None, trust_lineup: bool = True,
+    horizon: int = 1, recalibrators: dict | None = None,
 ) -> pd.DataFrame:
     """Start-probability blend, in priority order:
 
@@ -333,6 +336,20 @@ def compute_p_plays_60(
     carry-forward behavior can pass trust_lineup=True for every horizon.
     """
     trailing_p60 = pool["trail_starts5"].clip(0, 1)
+    if recalibrators and horizon in recalibrators:
+        # trail_starts5 is real signal (beats a naive last-match baseline
+        # at every horizon, validated on the full 25-26 history) but is
+        # overconfident at both extremes, worse the longer the horizon:
+        # predicted ~0 actually plays 60+ 13-19% of the time, predicted
+        # ~1.0 actually falls short of 60 minutes 16-26% of the time. This
+        # per-horizon logistic map (fit in fit_p60_recalibration) squeezes
+        # it back toward the true out-of-sample rate. Never applied to a
+        # RotoWire-sourced probability below — that's real lineup evidence,
+        # not the same estimator this was fit to correct.
+        model = recalibrators[horizon]
+        trailing_p60 = pd.Series(
+            model.predict_proba(trailing_p60.values.reshape(-1, 1))[:, 1], index=pool.index
+        )
     p60 = trailing_p60.copy()
     source = pd.Series("trailing_starts", index=pool.index)
 
@@ -384,12 +401,54 @@ def compute_p_plays_60(
     return pool
 
 
+def fit_p60_recalibration(max_horizon: int = 4) -> dict[int, LogisticRegression]:
+    """Per-horizon logistic recalibration of trail_starts5 against real
+    played-60+ outcomes on the complete 25-26 history.
+
+    trail_starts5 is genuine signal (beats a naive last-match-only
+    baseline at every horizon) but is measurably overconfident at both
+    extremes, and increasingly so the further out the horizon: rows
+    predicted ~0 actually go on to play 60+ minutes 13-19% of the time;
+    rows predicted ~1.0 actually fall short of 60 minutes 16-26% of the
+    time, with that top-end overconfidence worsening as horizon grows
+    (validated out-of-sample, train on rounds<=25 / test on rounds>25:
+    Brier improves at every horizon, and the improvement is largest at
+    horizon 4 — exactly where trail_starts5 is currently weakest and
+    RotoWire has no coverage at all to correct it). This fits the
+    production version on the full history rather than a held-out split.
+    """
+    hist_df = load_processed("player_gameweek_2025_26")
+    df2 = _add_trailing_features(hist_df)
+    origin = _origin_snapshot(df2)
+    origin = origin[origin["round"] >= MIN_ORIGIN_ROUND]
+    origin = origin[origin["trail_games5"] > 0]
+    targets = hist_df.groupby(["element", "round"], as_index=False).agg(target_minutes=("minutes", "sum"))
+
+    recalibrators = {}
+    for h in range(1, max_horizon + 1):
+        block = origin.copy()
+        block["target_round"] = block["round"] + h
+        block = block.merge(
+            targets, left_on=["element", "target_round"], right_on=["element", "round"],
+            how="inner", suffixes=("", "_target"),
+        )
+        y = (block["target_minutes"] >= 60).astype(float).values
+        x = block["trail_starts5"].clip(0, 1).values.reshape(-1, 1)
+        model = LogisticRegression()
+        model.fit(x, y)
+        recalibrators[h] = model
+    return recalibrators
+
+
 def _fit_production_models():
-    """Fit both production pieces once on the full 25-26 history: the 60+
-    NB2 GLM, and the MAE-optimal floor for everything below it (see
-    fit_floor_mae_optimal). Reused across every horizon in predict_multi_gw
-    rather than refit per gameweek — there's nothing horizon-specific about
-    either fit, both are read off each player's last 25-26 appearance.
+    """Fit all three production pieces once on the full 25-26 history: the
+    60+ NB2 GLM, the MAE-optimal floor for everything below it (see
+    fit_floor_mae_optimal), and the per-horizon p_plays_60 recalibration
+    (see fit_p60_recalibration). Reused across every horizon in
+    predict_multi_gw rather than refit per gameweek — there's nothing
+    horizon-specific about the GLM or floor fit, both are read off each
+    player's last 25-26 appearance; the recalibration IS horizon-specific
+    but is itself fit once, up front, covering every horizon at once.
     """
     from pipeline.features import feature_matrix
 
@@ -400,12 +459,13 @@ def _fit_production_models():
     train_60 = (full_df["target_minutes"] >= 60).values
     res, train_cols = fit_production_glm(full_df[train_60], X_full[train_60])
     floor = fit_floor_mae_optimal(full_df, X_full, res)
-    return res, train_cols, floor
+    recalibrators = fit_p60_recalibration()
+    return res, train_cols, floor, recalibrators
 
 
 def predict_gw(
     target_event: int, horizon: int = 1, res=None, train_cols=None, floor: float | None = None,
-    use_lineups: bool = True, lineup_data: tuple | None = None,
+    use_lineups: bool = True, lineup_data: tuple | None = None, recalibrators: dict | None = None,
 ) -> pd.DataFrame:
     """Score the entire eligible candidate pool for one target gameweek
     (not just a top-N slice) — this is what the squad optimizer draws
@@ -427,7 +487,7 @@ def predict_gw(
     from pipeline.features import feature_matrix
 
     if res is None or train_cols is None or floor is None:
-        res, train_cols, floor = _fit_production_models()
+        res, train_cols, floor, recalibrators = _fit_production_models()
 
     pool = build_gw_feature_rows(target_event, horizon)
     Xp, _ = feature_matrix(pool)
@@ -450,7 +510,8 @@ def predict_gw(
     # blindly carrying the horizon-1 lineup read forward (see its
     # docstring for the failure mode this fixes).
     pool = compute_p_plays_60(
-        pool, use_lineups=use_lineups, lineup_data=lineup_data, trust_lineup=(horizon == 1)
+        pool, use_lineups=use_lineups, lineup_data=lineup_data, trust_lineup=(horizon == 1),
+        horizon=horizon, recalibrators=recalibrators,
     )
     pool["predicted_points"] = (
         pool["p_plays_60"] * pool["quality_pred"] + (1 - pool["p_plays_60"]) * floor
@@ -487,7 +548,7 @@ def predict_multi_gw(horizons: tuple[int, ...] = (1, 2, 3, 4), discount: float =
     first — see compute_p_plays_60's docstring for why that carry-forward
     is preferred over reverting to the trailing-minutes proxy for GW2-4.
     """
-    res, train_cols, floor = _fit_production_models()
+    res, train_cols, floor, recalibrators = _fit_production_models()
     lineup_data = fetch_lineup_data()
     next_gw = get_next_gameweek()
     logger.info("next gameweek is GW%d — targeting GW%d-%d", next_gw, next_gw, next_gw + max(horizons) - 1)
@@ -497,7 +558,8 @@ def predict_multi_gw(horizons: tuple[int, ...] = (1, 2, 3, 4), discount: float =
     for h in horizons:
         target_event = next_gw + h - 1
         gw_pool = predict_gw(
-            target_event, h, res=res, train_cols=train_cols, floor=floor, lineup_data=lineup_data
+            target_event, h, res=res, train_cols=train_cols, floor=floor, lineup_data=lineup_data,
+            recalibrators=recalibrators,
         )
         weight = discount ** (h - 1)
         gw_pool = gw_pool.rename(columns={
