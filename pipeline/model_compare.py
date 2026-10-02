@@ -99,7 +99,10 @@ def run_walkforward(
     results = []
     pred_rows = []
     for i, (train_range, val_range) in enumerate(folds, start=1):
-        train_mask = horizon_df["origin_round"].between(*train_range)
+        # Purge: a training row's *target* must also precede the validation
+        # block, not just its origin — otherwise long horizons leak outcomes
+        # from inside the validation period into training.
+        train_mask = horizon_df["origin_round"].between(*train_range) & (horizon_df["target_round"] < val_range[0])
         val_mask = horizon_df["origin_round"].between(*val_range)
         Xtr, ytr = X[train_mask], horizon_df.loc[train_mask, "target_points"].values
         Xva, yva = X[val_mask], horizon_df.loc[val_mask, "target_points"].values

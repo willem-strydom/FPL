@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 HEADERS = {"User-Agent": USER_AGENT}
 
 
+FETCH_ATTEMPTS = 3
+
+
 def fetch_player_history(element_id: int) -> pd.DataFrame:
     """This season's gameweek-by-gameweek rows for one player (possibly
     empty if the season hasn't kicked off, or they haven't featured yet).
@@ -44,18 +47,29 @@ def fetch_all_current_season(
 ) -> pd.DataFrame:
     live_players = live_players if live_players is not None else load_raw("fpl_live_players")
 
-    frames = []
+    frames, failed = [], []
     for i, element_id in enumerate(live_players["id"], start=1):
-        try:
-            h = fetch_player_history(element_id)
-        except requests.RequestException as exc:
-            logger.warning("failed to fetch current-season history for element %s: %s", element_id, exc)
-            continue
-        if not h.empty:
+        for attempt in range(FETCH_ATTEMPTS):
+            try:
+                h = fetch_player_history(element_id)
+                break
+            except requests.RequestException as exc:
+                if attempt == FETCH_ATTEMPTS - 1:
+                    logger.warning("failed to fetch current-season history for element %s: %s", element_id, exc)
+                    failed.append(element_id)
+                    h = None
+                else:
+                    time.sleep(2 ** attempt)
+        if h is not None and not h.empty:
             frames.append(h)
         if i % 100 == 0:
             logger.info("fetched current-season history for %d/%d players", i, len(live_players))
         time.sleep(sleep_seconds)
+
+    # A partial pull would silently drop players' current-season form from
+    # every prediction downstream — refuse rather than save it.
+    if failed:
+        raise RuntimeError(f"current-season history fetch failed for {len(failed)} players (e.g. {failed[:5]}); not saving")
 
     if not frames:
         logger.warning("no current-season gameweek history available yet (season hasn't started?)")

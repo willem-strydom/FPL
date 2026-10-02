@@ -358,6 +358,203 @@ def select_squad(
     }
 
 
+MAX_BANKED_TRANSFERS = 5
+
+# Tuned by coordinate-descent sweep on the 25-26 backtest (16 jittered seeds,
+# best mean): +20 ± 14 over the FPLReview-style defaults (0.85 / 1.5 / all
+# weeks), +86 ± 32 over the old single-period production policy. Decay
+# 0.7-0.9 and every FT value tested were within noise of each other; decay
+# >= 0.95 and horizons < 8 were clearly worse. 0.7 is the lowest decay tried.
+PLANNER_HORIZON = 8
+PLANNER_DECAY = 0.7
+PLANNER_FT_VALUE = 0.75
+PLANNER_TRANSFER_WEEKS = 6
+
+
+def _milp_solver(time_limit: int):
+    # HiGHS (via highspy) solves the multi-period model ~1.5-2x faster than CBC
+    # with identical results. Single-threaded so parallel backtest workers
+    # don't contend for cores.
+    if "HiGHS" in pulp.listSolvers(onlyAvailable=True):
+        return pulp.HiGHS(msg=False, timeLimit=time_limit, threads=1)
+    return pulp.PULP_CBC_CMD(msg=0, timeLimit=time_limit)
+
+
+def _prefilter_pool(pool: pd.DataFrame, gw_cols: list[str], weights: list[float], keep: set,
+                    top_n: int, top_value_n: int, cheapest_n: int) -> pd.DataFrame:
+    """Shrink the candidate pool before the multi-period MILP: per position,
+    keep the top players by discounted EV, the top by EV per £, and the
+    cheapest (bench fodder), plus everyone currently owned."""
+    ev = sum(w * pool[c] for w, c in zip(weights, gw_cols))
+    pool = pool.assign(_ev=ev, _ev_per_m=ev / pool["price"])
+    keep_idx = set(pool.index[pool["code"].isin(keep)])
+    for _, g in pool.groupby("position_name"):
+        keep_idx |= set(g.nlargest(top_n, "_ev").index)
+        keep_idx |= set(g.nlargest(top_value_n, "_ev_per_m").index)
+        keep_idx |= set(g.nsmallest(cheapest_n, "price").index)
+    return pool.loc[sorted(keep_idx)].drop(columns=["_ev", "_ev_per_m"])
+
+
+def plan_transfers(
+    pool: pd.DataFrame,
+    current_squad_codes: set,
+    free_transfers: int,
+    horizon: int | None = None,
+    decay: float = PLANNER_DECAY,
+    ft_value: float = PLANNER_FT_VALUE,
+    transfer_weeks: int | None = PLANNER_TRANSFER_WEEKS,
+    rules: dict | None = None,
+    wildcard: bool = False,
+    top_n: int = 20,
+    top_value_n: int = 10,
+    cheapest_n: int = 5,
+    time_limit: int = 120,
+) -> dict:
+    """Multi-period rolling-horizon planner: one MILP over the next `horizon`
+    gameweeks with squad / XI / captain / transfers per player per week and
+    the exact free-transfer banking rule (cap 5; using more than banked costs
+    4 points each and leaves 1 for next week). Only week 1 is meant to be
+    executed; re-plan every week.
+
+    pool: one row per player with code, web_name, team_name, position_name,
+    price and predicted_points_gw1..gwH (a player with no fixture that week
+    scores 0 — pass NaN or 0).
+
+    Objective: sum_t decay^(t-1) * (XI points + captain bonus + bench value
+    - 4 * hits_t) + ft_value * (free transfers banked after the horizon).
+    ft_value is the only pricing of future flexibility beyond the horizon —
+    within it, banking vs spending is decided by the plan itself.
+
+    wildcard=True plays a wildcard in week 1: unlimited free transfers that
+    week, banked FTs kept; later weeks follow normal rules.
+    """
+    rules = rules or load_squad_rules()
+    missing = set(current_squad_codes) - set(pool["code"])
+    if missing:
+        # An owned player absent from the pool would be treated as sold for free.
+        raise ValueError(f"owned players missing from the planning pool: {sorted(missing)}")
+    gw_cols = sorted((c for c in pool.columns if c.startswith("predicted_points_gw")),
+                     key=lambda c: int(c.removeprefix("predicted_points_gw")))
+    horizon = min(horizon or len(gw_cols), len(gw_cols))
+    gw_cols = gw_cols[:horizon]
+    transfer_weeks = horizon if transfer_weeks is None else min(transfer_weeks, horizon)
+    weights = [decay ** t for t in range(horizon)]
+    T = range(horizon)
+
+    pool = pool.copy()
+    pool[gw_cols] = pool[gw_cols].fillna(0.0)
+    pool = _prefilter_pool(pool, gw_cols, weights, current_squad_codes, top_n, top_value_n, cheapest_n)
+    pool = pool.reset_index(drop=True)
+    idx = pool.index.tolist()
+    owned = pool["code"].isin(current_squad_codes).values
+    pred = pool[gw_cols].values
+    bench_w = [BENCH_GK_WEIGHT if p == "GKP" else BENCH_OUTFIELD_WEIGHT for p in pool["position_name"]]
+
+    prob = pulp.LpProblem("multi_period_plan", pulp.LpMaximize)
+    squad = pulp.LpVariable.dicts("squad", (idx, T), cat="Binary")
+    starter = pulp.LpVariable.dicts("starter", (idx, T), cat="Binary")
+    captain = pulp.LpVariable.dicts("captain", (idx, T), cat="Binary")
+    # continuous is enough: at the optimum it sits on max(0, squad_t - squad_{t-1})
+    tin = pulp.LpVariable.dicts("tin", (idx, T), lowBound=0, upBound=1)
+    ft = pulp.LpVariable.dicts("ft", range(horizon + 1), lowBound=0, upBound=MAX_BANKED_TRANSFERS, cat="Integer")
+    hits = pulp.LpVariable.dicts("hits", T, lowBound=0, cat="Integer")
+    over = pulp.LpVariable.dicts("over", T, cat="Binary")  # 1 iff transfers used exceed those banked
+    wasted = pulp.LpVariable.dicts("wasted", T, lowBound=0)  # accrual lost to the cap
+
+    objective = []
+    for t in T:
+        week = pulp.lpSum(
+            pred[i][t] * (starter[i][t] + captain[i][t] + bench_w[i] * (squad[i][t] - starter[i][t]))
+            for i in idx
+        ) - TRANSFER_HARD_COST * hits[t]
+        objective.append(weights[t] * week)
+    objective.append(ft_value * ft[horizon])
+    prob += pulp.lpSum(objective)
+
+    prob += ft[0] == max(0, min(MAX_BANKED_TRANSFERS, free_transfers))
+    big_m = rules["squad_size"]
+    for t in T:
+        for i in idx:
+            prev = int(owned[i]) if t == 0 else squad[i][t - 1]
+            prob += tin[i][t] >= squad[i][t] - prev
+            prob += starter[i][t] <= squad[i][t]
+            prob += captain[i][t] <= starter[i][t]
+        used = pulp.lpSum(tin[i][t] for i in idx)
+        if t >= transfer_weeks:
+            prob += used == 0
+        if wildcard and t == 0:
+            # Wildcard week: unlimited free transfers, and banked FTs are kept.
+            prob += hits[t] == 0
+            prob += ft[t + 1] == ft[t] + 1 - wasted[t]
+        else:
+            # hits_t == max(0, used_t - ft_t), exactly
+            prob += hits[t] >= used - ft[t]
+            prob += hits[t] <= big_m * over[t]
+            prob += hits[t] <= used - ft[t] + big_m * (1 - over[t])
+            prob += ft[t + 1] == ft[t] - used + hits[t] + 1 - wasted[t]
+
+        prob += pulp.lpSum(squad[i][t] for i in idx) == rules["squad_size"]
+        prob += pulp.lpSum(starter[i][t] for i in idx) == rules["starting_size"]
+        prob += pulp.lpSum(captain[i][t] for i in idx) == 1
+        prob += pulp.lpSum(squad[i][t] * pool.loc[i, "price"] for i in idx) <= rules["budget"] + 1e-6
+        for pos, n_required in rules["squad_select"].items():
+            pos_idx = pool.index[pool["position_name"] == pos].tolist()
+            prob += pulp.lpSum(squad[i][t] for i in pos_idx) == n_required
+            prob += pulp.lpSum(starter[i][t] for i in pos_idx) >= rules["min_play"][pos]
+            prob += pulp.lpSum(starter[i][t] for i in pos_idx) <= rules["max_play"][pos]
+        for club in pool["team_name"].dropna().unique():
+            club_idx = pool.index[pool["team_name"] == club].tolist()
+            prob += pulp.lpSum(squad[i][t] for i in club_idx) <= rules["club_limit"]
+
+    status = prob.solve(_milp_solver(time_limit))
+    if pulp.LpStatus[status] != "Optimal":
+        raise RuntimeError(f"multi-period solver did not find an optimal solution: {pulp.LpStatus[status]}")
+
+    val = lambda v: int(round(v.value()))
+    plan = []
+    for t in T:
+        in_codes = [i for i in idx if val(squad[i][t]) and not (owned[i] if t == 0 else val(squad[i][t - 1]))]
+        out_codes = [i for i in idx if (owned[i] if t == 0 else val(squad[i][t - 1])) and not val(squad[i][t])]
+        plan.append({
+            "week": t + 1,
+            "free_transfers": val(ft[t]),
+            "transfers_in": pool.loc[in_codes, "web_name"].tolist(),
+            "transfers_out": pool.loc[out_codes, "web_name"].tolist(),
+            "hits": val(hits[t]),
+            "xi_points": float(sum(pred[i][t] * (val(starter[i][t]) + val(captain[i][t])) for i in idx)),
+            "starters": pool.loc[[i for i in idx if val(starter[i][t])], "web_name"].tolist(),
+        })
+
+    pool["in_squad"] = [bool(val(squad[i][0])) for i in idx]
+    pool["is_starter"] = [bool(val(starter[i][0])) for i in idx]
+    pool["is_captain"] = [bool(val(captain[i][0])) for i in idx]
+    pool["predicted_points"] = pool[gw_cols[0]]
+    squad_df = pool[pool["in_squad"]].copy()
+    starters = squad_df[squad_df["is_starter"]].sort_values("predicted_points", ascending=False)
+    bench = squad_df[~squad_df["is_starter"]].sort_values("predicted_points", ascending=False)
+    captain_row = squad_df[squad_df["is_captain"]].iloc[0]
+    n_in = len(plan[0]["transfers_in"])
+    return {
+        "squad": squad_df,
+        "starters": starters,
+        "bench": bench,
+        "captain": captain_row,
+        "vice_captain": starters[~starters["is_captain"]].iloc[0],
+        "total_cost": float(squad_df["price"].sum()),
+        "starting_predicted_points": float(starters["predicted_points"].sum() + captain_row["predicted_points"]),
+        "transfer_info": {
+            "transfers_used": n_in,
+            "free_transfers": free_transfers,
+            "hard_cost": TRANSFER_HARD_COST * plan[0]["hits"],
+            "transferred_in": plan[0]["transfers_in"],
+            "transferred_out": plan[0]["transfers_out"],
+        },
+        "plan": plan,
+        "objective": float(pulp.value(prob.objective)),
+        "pool_size": len(pool),
+    }
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     from pipeline.predict_next_gw import predict_multi_gw

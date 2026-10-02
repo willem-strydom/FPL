@@ -34,7 +34,11 @@ logger = logging.getLogger(__name__)
 
 MIN_ORIGIN_ROUND = 4  # need a few prior fixtures before trailing stats mean anything
 TARGET_MIN_MINUTES = 60  # the "plays 60+ min" band from the point-decomposition formula
-DEFAULT_HORIZONS = (1, 2, 3, 4)
+# Trained on 1-8 so the multi-period planner has real projections 8 weeks out.
+# Purged walk-forward: h1-4 MAE unchanged vs training on 1-4 (2.3928 vs 2.3934),
+# h5-8 improved (2.4231 vs 2.4364 when extrapolating a 1-4 model).
+MAX_HORIZON = 8
+DEFAULT_HORIZONS = tuple(range(1, MAX_HORIZON + 1))
 MIN_RELIABLE_TRAILING_MINUTES = 30  # below this pooled minutes, a per-90 rate is noise
 
 _PER90_SOURCE_COLS = {
@@ -95,6 +99,24 @@ _PRUNED_FOR_COLLINEARITY = {
     "form_understat_xG_per90", "form_understat_xA_per90",
 }
 
+# Season-to-date (expanding) per-90 rates: a longer-run "talent" read
+# alongside the 5-game form rates. Walk-forward: MAE 2.3926 -> 2.3908, 4/6
+# folds, gains mostly FWD/DEF — small but consistent.
+_STD_SOURCE_COLS = {
+    "total_points": "std_points_per90",
+    "expected_goals": "std_xG_per90",
+    "expected_assists": "std_xA_per90",
+    "expected_goals_conceded": "std_xGA_per90",
+}
+STD_MIN_MINUTES = 90
+
+# Exponentially weighted start rate — the start-probability signal used by
+# predict_next_gw.compute_p_plays_60 (not a GLM feature). Beat trail_starts5
+# in 24/24 walk-forward fold x horizon Brier cells: a player who just won a
+# starting place isn't held back by benchings earlier in a flat 5-game window.
+START_RATE_COL = "starts_ewm"
+START_RATE_HALFLIFE = 1.5
+
 FEATURE_COLUMNS = [
     "horizon",
     "trail_minutes5",
@@ -102,7 +124,9 @@ FEATURE_COLUMNS = [
     "value",
     "target_difficulty",
     "target_was_home",
-] + [c for c in _PER90_SOURCE_COLS.values() if c not in _PRUNED_FOR_COLLINEARITY] + [DEFCON_HIT_RATE_COL]
+] + [c for c in _PER90_SOURCE_COLS.values() if c not in _PRUNED_FOR_COLLINEARITY] + [DEFCON_HIT_RATE_COL] + list(
+    _STD_SOURCE_COLS.values()
+)
 
 POSITION_COLUMN = "position"
 
@@ -163,6 +187,11 @@ def _add_trailing_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
     # tenure is a count of proof, not a recency-weighted quality read.
     df["cum_starts_to_date"] = grp["minutes"].transform(lambda s: (s >= 60).expanding().sum())
     df["cum_minutes_to_date"] = grp["minutes"].transform(lambda s: s.expanding().sum())
+    for src, name in _STD_SOURCE_COLS.items():
+        rate = grp[src].transform(lambda s: s.expanding().sum()) / df["cum_minutes_to_date"] * 90
+        df[name] = rate.where(df["cum_minutes_to_date"] >= STD_MIN_MINUTES)
+
+    df[START_RATE_COL] = grp["starts"].transform(lambda s: s.ewm(halflife=START_RATE_HALFLIFE).mean())
 
     # Minutes-weighted (pooled), not a mean-of-per-match-rates: summing the raw
     # stat and the minutes separately over the window before dividing avoids a
@@ -268,28 +297,7 @@ def build_horizon_table(
     combined = combined[combined["target_minutes"] >= target_min_minutes]
     if target_max_minutes is not None:
         combined = combined[combined["target_minutes"] <= target_max_minutes]
-    combined = combined.copy()
-
-    # Two independent reasons a form column can be NaN here, flagged before
-    # either gets filled in (order matters — the FPL-native columns go NaN
-    # together under the trailing-minutes floor; the Understat columns go NaN
-    # together under match/no-match coverage; filling one pass would erase
-    # the signal the other pass still needs to read):
-    #
-    # 1. A player can clear the "at least one appearance" bar above yet still
-    #    fall under MIN_RELIABLE_TRAILING_MINUTES (e.g. two separate 1-minute
-    #    cameos), leaving the core form columns NaN.
-    fpl_native_form_cols = [c for c in _PER90_SOURCE_COLS.values() if "understat" not in c] + [DEFCON_HIT_RATE_COL]
-    combined["form_unreliable"] = combined["form_points_per90"].isna().astype(int)
-    combined[fpl_native_form_cols] = combined[fpl_native_form_cols].fillna(0.0)
-
-    # 2. The player never matched to an Understat record, or matched but has
-    #    no trailing match-log coverage yet. xG and xA missingness always
-    #    coincide (same match/no-match), so one indicator covers both instead
-    #    of adding two perfectly collinear columns.
-    combined["understat_form_missing"] = combined["form_understat_xG_per90"].isna().astype(int)
-    for col in ("form_understat_xG_per90", "form_understat_xA_per90"):
-        combined[col] = combined[col].fillna(0.0)
+    combined = fill_missing_form(combined.copy())
 
     combined["group_key"] = (
         combined["element"].astype(str) + "_" + combined["origin_round"].astype(str)
@@ -303,12 +311,37 @@ def build_horizon_table(
     return combined
 
 
+def fill_missing_form(df: pd.DataFrame) -> pd.DataFrame:
+    """Flag-then-zero-fill the form columns, in place. Shared by the training
+    table and every scoring pool so the GLM always sees the same encoding.
+
+    Three independent reasons a rate can be NaN, each flagged before its own
+    fill (filling one group first would erase the signal another flag reads):
+      1. FPL-native form: under MIN_RELIABLE_TRAILING_MINUTES in the window.
+      2. Understat form: no Understat match / coverage (xG and xA missingness
+         always coincide, so one indicator covers both).
+      3. Season-to-date rates: under STD_MIN_MINUTES played this season.
+    """
+    fpl_native_form_cols = [c for c in _PER90_SOURCE_COLS.values() if "understat" not in c] + [DEFCON_HIT_RATE_COL]
+    df["form_unreliable"] = df["form_points_per90"].isna().astype(int)
+    df[fpl_native_form_cols] = df[fpl_native_form_cols].fillna(0.0)
+
+    understat_cols = ["form_understat_xG_per90", "form_understat_xA_per90"]
+    df["understat_form_missing"] = df["form_understat_xG_per90"].isna().astype(int)
+    df[understat_cols] = df[understat_cols].fillna(0.0)
+
+    std_cols = list(_STD_SOURCE_COLS.values())
+    df["std_unreliable"] = df["std_points_per90"].isna().astype(int)
+    df[std_cols] = df[std_cols].fillna(0.0)
+    return df
+
+
 def feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     """One-hot the position column, add the clean-sheet interaction terms,
     and return (X, feature_names). Same encoding used for both the GLM and
     the GBM for a fair comparison.
     """
-    cols = FEATURE_COLUMNS + ["understat_form_missing", "form_unreliable"]
+    cols = FEATURE_COLUMNS + ["understat_form_missing", "form_unreliable", "std_unreliable"]
     X = df[cols].copy()
     X["target_was_home"] = X["target_was_home"].astype(int)
     pos_dummies = pd.get_dummies(df[POSITION_COLUMN], prefix="pos", dtype=int)

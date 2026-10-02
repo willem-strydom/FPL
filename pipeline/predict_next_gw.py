@@ -21,11 +21,14 @@ import statsmodels.discrete.discrete_model as dm
 from sklearn.linear_model import LogisticRegression
 
 from pipeline.features import (
+    MAX_HORIZON,
     MIN_ORIGIN_ROUND,
     POSITION_COLUMN,
+    START_RATE_COL,
     _add_trailing_features,
     _origin_snapshot,
     build_horizon_table,
+    fill_missing_form,
 )
 from pipeline.lineups import BENCH_PROB, get_start_probabilities
 from pipeline.matching import normalize_team
@@ -260,17 +263,7 @@ def build_gw_feature_rows(target_event: int, horizon: int = 1) -> pd.DataFrame:
     pool["target_was_home"] = pool["fx_was_home"]
     pool[POSITION_COLUMN] = pool["position_name"].map({"GKP": "GK", "DEF": "DEF", "MID": "MID", "FWD": "FWD"})
 
-    # same NaN handling as build_horizon_table, and in the same order: flag
-    # before fill, FPL-native columns first, then Understat's.
-    from pipeline.features import DEFCON_HIT_RATE_COL, _PER90_SOURCE_COLS
-
-    fpl_native_form_cols = [c for c in _PER90_SOURCE_COLS.values() if "understat" not in c] + [DEFCON_HIT_RATE_COL]
-    pool["form_unreliable"] = pool["form_points_per90"].isna().astype(int)
-    pool[fpl_native_form_cols] = pool[fpl_native_form_cols].fillna(0.0)
-
-    pool["understat_form_missing"] = pool["form_understat_xG_per90"].isna().astype(int)
-    for c in ("form_understat_xG_per90", "form_understat_xA_per90"):
-        pool[c] = pool[c].fillna(0.0)
+    pool = fill_missing_form(pool)
 
     # `was_home` here would collide with the stale historical was_home carried
     # over from each player's last 25-26 gameweek row (still present from the
@@ -317,11 +310,12 @@ def compute_p_plays_60(
        goal, regardless of how many minutes he played last season
        elsewhere.
     3. No lineup published yet for that team, `use_lineups=False`, or
-       `trust_lineup=False` -> fall back to the trailing 5-gameweek
-       season-weighted STARTS fraction (trail_starts5, see features.py) —
-       not trailing minutes. Distinguishes a player who reliably plays a
-       full 90 from one who starts but is frequently subbed off early;
-       trailing minutes alone can't (both can show a similar average).
+       `trust_lineup=False` -> fall back to the exponentially weighted
+       start rate (START_RATE_COL, see features.py), recalibrated per
+       horizon. Starts rather than minutes, so a reliable 90-minute player
+       separates from one who starts but is often subbed early; recency-
+       weighted, so a player who just won a starting place isn't held back
+       by benchings earlier in the season.
 
     RotoWire only ever publishes a lineup for the *next* upcoming
     gameweek — there's no real GW2-4 lineup to fetch. `trust_lineup`
@@ -335,17 +329,13 @@ def compute_p_plays_60(
     one who never leaves the pitch). Callers that still want the old
     carry-forward behavior can pass trust_lineup=True for every horizon.
     """
-    trailing_p60 = pool["trail_starts5"].clip(0, 1)
+    trailing_p60 = pool[START_RATE_COL].clip(0, 1)
     if recalibrators and horizon in recalibrators:
-        # trail_starts5 is real signal (beats a naive last-match baseline
-        # at every horizon, validated on the full 25-26 history) but is
-        # overconfident at both extremes, worse the longer the horizon:
-        # predicted ~0 actually plays 60+ 13-19% of the time, predicted
-        # ~1.0 actually falls short of 60 minutes 16-26% of the time. This
-        # per-horizon logistic map (fit in fit_p60_recalibration) squeezes
-        # it back toward the true out-of-sample rate. Never applied to a
-        # RotoWire-sourced probability below — that's real lineup evidence,
-        # not the same estimator this was fit to correct.
+        # The raw start rate is overconfident at both extremes, worse at
+        # longer horizons; this per-horizon logistic map (fit in
+        # fit_p60_recalibration) pulls it back to the observed rate. Never
+        # applied to a RotoWire-sourced probability below — that's real
+        # lineup evidence, not the estimator this was fit to correct.
         model = recalibrators[horizon]
         trailing_p60 = pd.Series(
             model.predict_proba(trailing_p60.values.reshape(-1, 1))[:, 1], index=pool.index
@@ -401,21 +391,16 @@ def compute_p_plays_60(
     return pool
 
 
-def fit_p60_recalibration(max_horizon: int = 4) -> dict[int, LogisticRegression]:
-    """Per-horizon logistic recalibration of trail_starts5 against real
-    played-60+ outcomes on the complete 25-26 history.
+def fit_p60_recalibration(max_horizon: int = MAX_HORIZON) -> dict[int, LogisticRegression]:
+    """Per-horizon logistic recalibration of the start rate (START_RATE_COL)
+    against real played-60+ outcomes on the complete 25-26 history.
 
-    trail_starts5 is genuine signal (beats a naive last-match-only
-    baseline at every horizon) but is measurably overconfident at both
-    extremes, and increasingly so the further out the horizon: rows
-    predicted ~0 actually go on to play 60+ minutes 13-19% of the time;
-    rows predicted ~1.0 actually fall short of 60 minutes 16-26% of the
-    time, with that top-end overconfidence worsening as horizon grows
-    (validated out-of-sample, train on rounds<=25 / test on rounds>25:
-    Brier improves at every horizon, and the improvement is largest at
-    horizon 4 — exactly where trail_starts5 is currently weakest and
-    RotoWire has no coverage at all to correct it). This fits the
-    production version on the full history rather than a held-out split.
+    A raw start rate is overconfident at both extremes, increasingly so at
+    longer horizons (originally found on trail_starts5: rows at ~0 still
+    played 60+ 13-19% of the time, rows at ~1.0 fell short 16-26%). The
+    EWM rate plus this recalibration beat trail_starts5 plus the same
+    recalibration in 24/24 walk-forward fold x horizon Brier cells. Fit on
+    the full history for production.
     """
     hist_df = load_processed("player_gameweek_2025_26")
     df2 = _add_trailing_features(hist_df)
@@ -433,7 +418,7 @@ def fit_p60_recalibration(max_horizon: int = 4) -> dict[int, LogisticRegression]
             how="inner", suffixes=("", "_target"),
         )
         y = (block["target_minutes"] >= 60).astype(float).values
-        x = block["trail_starts5"].clip(0, 1).values.reshape(-1, 1)
+        x = block[START_RATE_COL].clip(0, 1).values.reshape(-1, 1)
         model = LogisticRegression()
         model.fit(x, y)
         recalibrators[h] = model
@@ -506,7 +491,7 @@ def predict_gw(
     # fit_floor_mae_optimal) — replaces the old hardcoded FLOOR_POINTS=0.5.
     # RotoWire's fetched lineup only really speaks to the literal next
     # gameweek — trust it as an override only for horizon==1; for horizon
-    # 2-4, compute_p_plays_60 falls back to trail_starts5 instead of
+    # 2-4, compute_p_plays_60 falls back to the recalibrated start rate instead of
     # blindly carrying the horizon-1 lineup read forward (see its
     # docstring for the failure mode this fixes).
     pool = compute_p_plays_60(
@@ -539,9 +524,9 @@ def predict_multi_gw(horizons: tuple[int, ...] = (1, 2, 3, 4), discount: float =
     to react with a transfer before later gameweeks arrive anyway, which
     this static, no-swaps-within-the-window optimization can't capture.
 
-    All four gameweeks share the same eligibility/cold-start/availability
-    pool (checked upstream to have no blank/double gameweeks in this
-    range), so a plain per-player merge across horizons is safe here.
+    Blank gameweeks score 0 for that week (outer merge) and double
+    gameweeks sum both fixtures, so the per-week columns are safe to feed a
+    multi-period planner over long horizons.
 
     The RotoWire lineup snapshot (next-gameweek predicted/confirmed
     starters) is fetched once and applied to every horizon, not just the
@@ -572,14 +557,18 @@ def predict_multi_gw(horizons: tuple[int, ...] = (1, 2, 3, 4), discount: float =
             "was_home": f"was_home_gw{h}",
         })
         per_gw[h] = (gw_pool, weight)
-        keep_cols = ["code", f"predicted_points_gw{h}", f"quality_pred_gw{h}", f"p_plays_60_gw{h}",
-                     f"p_plays_60_source_gw{h}", f"target_difficulty_gw{h}", f"opponent_gw{h}", f"was_home_gw{h}"]
-        slim = gw_pool[keep_cols]
-        combined = slim if combined is None else combined.merge(slim, on="code", how="inner")
+        keep_cols = [f"quality_pred_gw{h}", f"p_plays_60_gw{h}", f"p_plays_60_source_gw{h}",
+                     f"target_difficulty_gw{h}", f"opponent_gw{h}", f"was_home_gw{h}"]
+        slim = gw_pool.groupby("code").agg(
+            {f"predicted_points_gw{h}": "sum", **{c: "first" for c in keep_cols}}
+        ).reset_index()
+        combined = slim if combined is None else combined.merge(slim, on="code", how="outer")
 
     base_cols = ["code", "web_name", "full_name", "team_name", "position_name", "price", "selected_by_percent"]
-    base = per_gw[horizons[0]][0][base_cols]
+    base = pd.concat([pool[base_cols] for pool, _ in per_gw.values()]).drop_duplicates("code")
     combined = base.merge(combined, on="code", how="inner")
+    pp_cols = [f"predicted_points_gw{h}" for h in horizons]
+    combined[pp_cols] = combined[pp_cols].fillna(0.0)
 
     combined["predicted_points"] = sum(
         weight * combined[f"predicted_points_gw{h}"] for h, (_, weight) in per_gw.items()
@@ -674,6 +663,8 @@ def build_enabler_candidates(
     candidates["predicted_points"] = (
         ENABLER_POINTS_PER_START * candidates["p_plays_60_lineup"] * weight_sum
     )
+    for h in horizons:  # per-week columns for the multi-period planner
+        candidates[f"predicted_points_gw{h}"] = ENABLER_POINTS_PER_START * candidates["p_plays_60_lineup"]
     candidates["is_enabler_candidate"] = True
     candidates["p_plays_60"] = candidates["p_plays_60_lineup"]
     candidates["p_plays_60_source"] = candidates["confirmed_starter"].map(
@@ -690,7 +681,7 @@ def build_enabler_candidates(
         "code", "web_name", "full_name", "team_name", "position_name", "price",
         "predicted_points", "p_plays_60", "p_plays_60_source", "selected_by_percent",
         "reason", "is_enabler_candidate",
-    ]
+    ] + [f"predicted_points_gw{h}" for h in horizons]
     logger.info(
         "enabler candidates: %d added (%s)",
         len(picked), dict(picked.groupby("position_name")["web_name"].apply(list)),
