@@ -1,171 +1,283 @@
 # FPL Points Prediction & Team Optimization — Implementation Report
 
-This document summarizes what was actually built, validated, and shipped against the goals set out in [DesignDoc.md](DesignDoc.md): a points-prediction model and a mathematical-programming squad optimizer that uses it. It focuses on modeling, validation, and system design decisions — not code-level detail — and deliberately includes the dead ends and negative results that shaped the final design, since several of them are the reason the system looks the way it does.
+*Last updated 2026-10-09 (2026-27 season, ahead of GW6).*
+
+This document summarizes what was built, validated, and shipped against the goals in [DesignDoc.md](DesignDoc.md): a points-prediction model and a mathematical-programming optimizer that turns it into weekly squad, transfer and chip decisions. It covers modeling, validation and system design rather than code, and deliberately records the dead ends, negative results and reversals — several of them are the reason the system looks the way it does.
+
+The short version of where things stand:
+
+- **Points model**: a Negative Binomial (NB2) GLM for points given 60+ minutes, trained on the complete 2025-26 season with horizons 1-8, combined with a separately estimated probability of playing 60+ minutes and a calibrated floor for everything else.
+- **Decisions**: a multi-period mixed-integer planner that schedules transfers over the next 8 gameweeks with the real free-transfer banking rules, tuned on a full-season backtest; chips are recommended against thresholds derived the same way.
+- **Weekly use**: `python -m pipeline.recommend --refresh` pulls the manager's actual squad from the FPL API and prints this week's transfers, the multi-week plan, a wildcard squad, and a chip check.
 
 ---
 
 ## 1. Data Infrastructure
 
-Two genuinely different data sources feed the system, kept structurally separate because they answer different questions:
+Several sources feed the system, kept structurally separate because they answer different questions:
 
-- **Historical archive (2025-26 season, per-gameweek)**: ~29,750 rows across all 38 gameweeks, 841 distinct players who appeared at some point that season. This is the only data used to *train* anything — it has known outcomes to learn from. Enriched with xG/xA from FBref and Understat (used as a cross-check against each other), matched to FPL player records by name/team.
-- **Live FPL API (bootstrap-static + fixtures)**: the *current* season's squad membership, prices, ownership, fitness/status flags, and official squad-building rules (budget, formation limits, per-club cap). This is the source of truth for "who's actually available to pick right now" — re-fetched fresh on every optimizer run rather than cached, since prices and injury status change frequently, especially close to a season's start.
-- **RotoWire (scraped)**: predicted/confirmed starting lineups for the next upcoming gameweek. Legally scraped per RotoWire's own robots.txt/llms.txt terms — distinct from bypassing bot detection. Used only as a start-probability signal (see §7), not for any points modeling.
+- **Historical archive (2025-26, per gameweek)** — ~29,750 rows, all 38 gameweeks, 841 players, enriched with Understat xG/xA. This is the only data used to *train* models, because it has known outcomes.
+- **Live FPL API** (bootstrap-static, fixtures) — the current season's players, prices, ownership, fitness flags and the official squad rules (budget, formation limits, club cap). Rules are read live, never hardcoded.
+- **Current-season gameweek history** (FPL `element-summary` per player) — this season's per-gameweek rows, used to build live features. The ingest retries each player and refuses to save a partial pull: a transient network outage once overwrote good data with a pull missing 248 players, which would have silently degraded every prediction.
+- **Manager entry** (FPL `entry` endpoints) — the user's actual squad, bank, chips used and transfer history (§10).
+- **RotoWire lineups** (scraped, within RotoWire's published terms) — predicted/confirmed XIs for the next gameweek, used only as a start-probability signal. Each fetch now also saves a dated snapshot, so lineup accuracy can eventually be backtested (previously each fetch overwrote the last).
 
-All raw pulls and derived tables are cached to disk as Parquet (`data/raw/`, `data/processed/`) via a small storage layer, so re-running any stage doesn't require re-fetching upstream data unless it's genuinely stale. An automated data-validation pass checks the ingested historical archive on every build — row counts within expected ranges, all 38 gameweeks present, no unintended duplicate (player, fixture) rows (818 legitimate double-gameweek rows are expected and distinguished from bugs), full Understat match-log coverage for matched players, and no nulls in core fields (minutes, points, kickoff time, etc.).
+Everything is cached as Parquet under `data/raw/` and `data/processed/`. An automated validation pass checks the historical archive on every build (row counts, all gameweeks present, legitimate vs. duplicate double-gameweek rows, Understat coverage, no nulls in core fields).
 
-**Player identity across sources** is matched via FPL's stable `code` field (not `id`, which gets reassigned across seasons) and, where name-based matching against FBref/Understat is needed, a token-containment match with a tiebreak on combined web-name + full-name token overlap — added after an early bug where a common first name (multiple "Gabriel"s across different clubs) matched to the wrong player and silently dropped the correct one from model output.
+**Player identity**: matched on FPL's season-stable `code`, never the per-season `id`/`element` (which is reassigned each season — an early bug merged two unrelated players' histories). Name matching against Understat uses token containment with a web-name/full-name overlap tiebreak, added after common first names matched the wrong player.
 
 ---
 
 ## 2. Feature Engineering & Leakage-Safe Design
 
-### Training table construction
+### Training table
 
-The core training table is **horizon-as-feature**: one row per (player, origin gameweek, horizon), where horizon ∈ {1, 2, 3, 4} and the target is that player's points scored *horizon* gameweeks after the origin. This lets one model learn "points N weeks out" as a function of how far out N is, rather than training four separate models or one multi-output model — maximizing usable training rows per horizon and letting the model learn its own regression-to-the-mean pattern as horizon grows, per the original design doc's reasoning. `horizon` enters the model as a plain numeric feature, not one-hot encoded.
+The core table is **horizon-as-feature**: one row per (player, origin gameweek, horizon), target = points scored *horizon* gameweeks after the origin. One model learns "points N weeks out" with `horizon` as a numeric feature. Horizons now run **1-8** (originally 1-4) so the planner has real projections eight weeks ahead. Every feature uses only data up to the origin gameweek; double gameweeks are summed into one gameweek target.
 
-Every feature is computed strictly from data available as of the origin gameweek — never the target gameweek. Double gameweeks (two fixtures in one round) are summed into a single gameweek-total target, and the origin snapshot is taken after the round's last fixture so trailing features already reflect both matches.
+### Features
 
-### Trailing features
+- **Playing-time trend**: `trail_minutes5` (mean minutes over the last 5 gameweeks, zeros included) and `trail_games5` (appearances, also the eligibility gate).
+- **Form rates (5 appearances)**: pooled per-90 rates — summed stat / summed minutes × 90, so a cameo goal isn't read as a 45-per-90 player — for points, xG, xA, xGA, plus a **DefCon hit rate** (share of recent appearances clearing the position's defensive-contribution bonus threshold: 10 for DEF, 12 for MID/FWD). The hit rate replaced raw DefCon per 90 because the bonus is a hard threshold, so expected bonus is linear in the hit probability, not the raw count. Below 30 pooled minutes a rate is treated as noise and the last reliable value is carried forward.
+- **Season-to-date rates**: expanding (not rolling) per-90 points, xG, xA and xGA, null under 90 season minutes. Added after the expert-team analysis (§9) as a longer-run "talent" read alongside 5-game form: walk-forward MAE 2.3926 → 2.3908, 4/6 folds.
+- **Fixture**: FPL's official difficulty rating (FDR) and home/away for the target fixture, plus position dummies and two clean-sheet interaction terms (§3).
+- **Data-quality flags**: unreliable form, missing Understat coverage, unreliable season-to-date rates — so the model can tell "genuinely low" from "not enough data". All three flag-then-fill steps live in one shared helper used by training, live scoring and the backtest.
 
-- **`trail_minutes5`**: rolling mean of minutes played over the last 5 gameweeks, *including* zero-minute weeks. This is the "will they start" signal — playing-time trend, not quality.
-- **`trail_games5`**: appearance count in the last 5 gameweeks; used as an origin-eligibility gate (a player needs at least one recent appearance to get an origin row at all).
-- **`trail_points5`**: rolling mean of actual points scored over the last 5 gameweeks. Used only as the "naive forecast" baseline comparator in validation, never as a model input.
-- **Per-90 form rates** (points, goals, assists, BPS, ICT, FPL's own xG/xA, Understat's xG/xA): pooled over the player's last 5 *appearances* (minutes > 0 only), computed as summed-stat / summed-minutes × 90 rather than an average of per-match rates — this avoids a 2-minute cameo goal being read as a 45-points-per-90 extrapolation. Below a reliability floor (30 pooled minutes), the rate is treated as noise and the last reliable value is carried forward instead.
+### Feature pruning
 
-### Cumulative-to-date features (added during the validation work — see §5)
+A VIF diagnosis found the attacking-output cluster (points, goals, BPS, ICT per 90, and Understat xG/xA duplicating FPL's own) badly collinear: goals per 90 carried a significantly *negative* coefficient. Dropping only the Understat pair didn't fix it; dropping the whole cluster did — every remaining coefficient took the expected sign (xG and xA positive and significant), walk-forward accuracy was unchanged, and BIC was the best of all candidates.
 
-Two additional features track each player's **career-to-date** tenure using an *expanding* (not rolling) window: cumulative starts and cumulative minutes, strictly up to and including each row's own origin round. These are the leakage-safe, walk-forward-compatible version of the "has this player actually proven a squad role" question that the live cold-start filter answers using full-season hindsight — necessary because reusing the full-season version inside a chronological validation fold would leak future information.
+### Leakage-safe validation
 
-### Leakage-safe cross-validation
-
-Because the horizon-as-feature design produces near-duplicate rows (the same origin snapshot repeated 4 times with only the target fixture changing), naive row-level CV would leak: two rows from the same decision point could land on opposite sides of a train/validation split. All validation in this project uses **walk-forward, expanding-window CV grouped by (player, origin gameweek)** — every horizon-row from one decision point moves together into the same fold, and folds only ever train on gameweeks strictly before their validation window.
+Horizon-as-feature creates near-duplicate rows, so all validation is **walk-forward, expanding-window CV grouped by (player, origin gameweek)**. A further leak was found when extending to 8 horizons: folds split on the *origin* round only, so a training row from origin 13, horizon 4 had its target in the next validation block. Training rows are now **purged** unless their target round precedes the validation block. The leak turned out to be worth only ~0.002 MAE at horizons 1-4, so earlier conclusions stand, but it would have grown with longer horizons.
 
 ---
 
-## 3. Points Model: Architecture & Selection
+## 3. Points Model
 
-### The point-decomposition formula
+### Decomposition
 
-Per the design doc, raw points are not predicted directly (which would conflate "bad player" with "good player who doesn't play"). Points are decomposed as:
+Raw points are not predicted directly (that conflates "bad player" with "good player who doesn't play"):
 
 ```
-E[points] = P(plays 60+ min) × E[points | plays 60+ min]
-          + P(plays 1-59 min) × E[points | plays 1-59 min]
-          + P(doesn't play)   × baseline appearance floor
+E[points] = P(plays 60+) × E[points | plays 60+] + (1 − P(plays 60+)) × floor
 ```
 
-Start probability is sourced from data (trailing minutes, later upgraded with lineup data — see §7), not modeled from scratch. The "quality" piece — E[points | plays 60+ minutes] — is where the real modeling effort went.
+The start probability comes from data (§5), the quality term from the GLM, and the floor is a calibrated constant (§4).
 
-### GLM vs. GBM
+### Model choice and architecture
 
-Per the design doc's own open question, a Poisson/Negative-Binomial GLM was compared empirically against a shallow, heavily regularized GBM via the same walk-forward validation, on the 60+-minute band. Measuring Pearson dispersion on that band came out at ~1.64-1.65 — genuinely overdispersed — so Negative Binomial (NB2), not plain Poisson, was used. The GLM and GBM came out comparably accurate; the GLM was kept as the production model for being far more data-efficient and interpretable, consistent with the design doc's stated bias against complexity that doesn't earn its place with a measurable accuracy gain.
+- **GLM vs. GBM**: Pearson dispersion on the 60+ band is ~1.65, so NB2 rather than Poisson. A shallow regularized GBM was comparably accurate; the GLM was kept for data-efficiency and interpretability.
+- **Position architecture**: pooled model vs. a full split into GK+DEF and MID+FWD models vs. pooled with clean-sheet interaction terms (`xGA × defensive`, `fixture difficulty × defensive`). The interaction version won outright (best overall, best for DEF and GK); the split lost even to plain pooling.
+- **Horizons 1-8** (purged walk-forward): horizons 1-4 unchanged by also training on 5-8 (2.3928 vs 2.3934 MAE); horizons 5-8 clearly better than extrapolating a 1-4 model (2.4231 vs 2.4364). Error rises only gently with distance — 2.384 at one week out, 2.435 at eight.
 
-**Final GLM feature set**: horizon, trail_minutes5, trail_games5, price, target fixture difficulty, target home/away, the per-90 form rates listed in §2, position (one-hot, goalkeeper dropped as the baseline category), and two data-quality indicator flags (whether the form rate was unreliable / whether Understat coverage was missing) so the model can distinguish "genuinely low form" from "insufficient data to know." No formal feature-pruning pass was performed — the walk-forward validation didn't surface an overfitting problem that pruning would fix, so the added complexity of a selection step wasn't judged to have earned its place either.
+### Tested and rejected
 
-### What originally covered the other two terms — and why that was a gap
+Each of these was a reasonable idea, tested with the same walk-forward framework, and not adopted:
 
-Until partway through this project, only the 60+-minute term had a real model. The 1-59-minute and 0-minute terms were both served by a single hardcoded constant (0.5 points), never fit to any data. More importantly, **every validation number reported up to that point had only ever scored the raw 60+ GLM against rows that were already known to have reached 60+ minutes** — never the full blended formula against real, unfiltered outcomes. This was caught directly by a pointed question about what "validated" actually meant, and prompted the work in §4-5.
+| Idea | Result |
+|---|---|
+| Replace FDR with opponents' rolling xG for/against | Worse at every position (2.4161 vs 2.3926); rolling goals worse still (2.4359) |
+| Rolling window other than 5 (3-10) | 8-10 marginally better (2.3910 at 10), mostly DEF/GK; deferred because longer windows delay feature maturity early in a season |
+| GBM residual-boosting on top of the GLM | No gain (2.3941), won only 2/6 folds; worse, it applied a −1.95-point "correction" to Haaland — trees can't extrapolate to extreme players, so the most decision-relevant prediction was the most distorted |
+| Penalty-taker feature (cumulative penalty xG) | Significant, correctly signed coefficient but no accuracy gain — already captured by form rates |
+| xG/xA × defender interactions | Null; slightly worse for defenders themselves |
+| Separate 1-59-minute GLM (3-term pipeline) | Statistically tied with the 2-term formula; simpler version kept |
 
-A genuine second GLM was then built for the 1-59-minute band. Its dispersion came out the *opposite* way from the 60+ band — Pearson dispersion ~0.34 (underdispersed), NB2's overdispersion parameter collapsed toward zero and its AIC was worse than plain Poisson's — so a plain Poisson GLM was used for that band specifically. Combined with a fitted DNP baseline (the training-data mean for the 0-minute band), this produced a proper three-term blended pipeline, validated end to end against every real outcome (0, 1-59, and 60+ minutes together) for the first time.
+### Calibration checks
 
-**Result**: the 3-term pipeline came out statistically tied with the simpler 2-term (hardcoded floor) pipeline overall — about a 0.001 MAE difference, both clearly ahead of a naive rolling-average baseline. The sub-60 GLM was genuinely good *within its own band* (roughly half the error of the rolling-average baseline there), but that gain doesn't survive being blended in at low weight against the dominant terms. Broken out by position, DEF and GK modestly favored the 3-term version, MID favored the simpler one, FWD was mixed. Given the tie, and the project's standing bias toward simplicity, the added sub-60 GLM was **not** adopted into production — see §6 for what was adopted instead.
+Stratifying out-of-fold residuals by 5-game form, xGI and season-to-date output showed **no systematic under-prediction of in-form players** (calibration slopes 0.84-1.0; slopes below 1 mean predictions are if anything slightly too spread, not compressed). The one exception is in-form defenders (top quintile under-predicted by 0.33 ± 0.11 per game). The players an optimizer would buy — top 3 predicted per position each week — came in at −0.02 ± 0.12 points versus prediction: no detectable winner's curse. **Caveat:** the first validation fold starts at GW14, so early-season calibration is untested.
 
 ---
 
 ## 4. Floor Calibration
 
-With the full pipeline finally being validated honestly, the obvious next question was whether the 0.5-point hardcoded floor constant was any good. It hadn't been calibrated at all, so several approaches were tried:
+The original hardcoded floor (0.5 points for anyone not reaching 60 minutes) was never fit to data. A naive mean made things worse (it describes high-probability players who rarely trigger the floor), a weighted mean was worse on MAE, and the **weighted median** — the MAE-optimal constant under the formula's own weighting — gave a stable ~−0.10 and a consistent improvement (MAE 1.919 vs 1.981 for the hardcoded floor) across every position, season third and ownership tier.
 
-- **Naive fix — replace 0.5 with the training data's actual mean points for the sub-60-minute band.** This made MAE and bias *worse* in every single validation fold. Diagnosis: the formula's `(1 - P(60+))` weighting concentrates its influence on low-probability (rotation-risk) players, whose true conditional outcome skews toward zero — but the unconditional mean is dragged upward by high-probability players who only occasionally miss the 60-minute cutoff while still picking up decent partial minutes. The naive mean describes a population the floor barely applies to.
-- **A properly weighted mean** (least-squares optimal given the formula's own weighting) — still worse on MAE, though slightly better on RMSE. Points in this band are heavily right-skewed and zero-inflated (roughly 61% literal zeros), so mean and median diverge substantially, and MAE — not RMSE — is the more decision-relevant metric here.
-- **A weighted median** — the true MAE-optimal single constant for this kind of weighted problem. This produced a stable value of roughly **-0.10** across every validation fold (a small negative correction, not a positive "token appearance" bonus) and delivered a real, consistent improvement: overall MAE of 1.919, against 1.981 for the hardcoded floor and 1.980 for the (more complex) 3-term pipeline, with a naive rolling-average baseline at 2.064. This edge held up across every position, every third of the season, and every ownership threshold checked.
-
-### A second attempt that backfired, and why
-
-A large fraction of every player ever appearing in the archive (roughly half) is a fringe squad player who essentially never gets real minutes — reserves, academy players, long-term absentees the FPL API still tracks. Measuring precisely: this contamination is mostly filtered out already by construction (a fringe player rarely reaches 60+ minutes, so that model's training set self-cleans to ~99% real players), but it concentrates heavily in the 0-minute outcome band (~33% of those training rows), which is exactly what the floor and the sub-60 rate constant are fit on.
-
-The natural next fix — refit the floor's weighted median restricted to "established" (leakage-safe cumulative tenure) players only — was tried and made things **substantially worse**, not better: the fitted value became unstable (swinging between -0.95 and -0.39 across folds instead of the previous stable -0.10) and underperformed even the plain hardcoded floor. The reason: established players mostly carry *high* start-probability, hence *small* weight in this specific fit — restricting to them doesn't just shrink the row count, it shrinks the total weight backing the estimate by roughly 8x, leaving a noisy fit dominated by a handful of currently-out-of-form regulars. This was reverted; the deployed floor is fit on the full, unfiltered population. The same restriction, applied only to the smaller *rate* constant (P(plays partial minutes | not 60+)), was safe and mildly beneficial — that estimate doesn't have the same weight-instability problem.
-
-This distinction — population filtering helps some parts of the pipeline and actively hurts others, depending on how sensitive each specific estimator is to sample size and weight concentration — was the main lesson of this phase, and is documented directly in the code (`two_stage_pipeline.py`) so it isn't rediscovered the hard way again.
+Refitting the floor on "established" players only made it unstable and worse: those players carry high start probability, hence small weight in this fit, so restriction shrank the weight backing the estimate ~8×. The lesson — population filtering helps some estimators and hurts others depending on how their weight concentrates — is documented in the code.
 
 ---
 
-## 5. Validation Methodology: From Row Averages to Deployment Reality
+## 5. Start Probability (P(plays 60+))
 
-Several rounds of scrutiny progressively tightened what "validated" actually means for this project:
+In priority order per player:
 
-1. **Raw GLM only → full blended pipeline.** Described in §3 — the original numbers only ever tested the 60+ model against already-known 60+ outcomes.
-2. **Aggregate accuracy → partitioned accuracy.** Errors were broken out by ownership tier, position, and time-of-season rather than reported as one blended number, surfacing that the model's edge over baseline *widens* with ownership even though absolute error is worse there (high-ownership players are intrinsically higher-variance, across every model tested including the naive baseline — not a symptom of undertrained), and that different positions favor different formula variants.
-3. **Training population → deployment population.** The live pipeline's cold-start filter means roughly a quarter of every validation fold's rows — and ~42% of its 0-minute-outcome rows — are fringe players the deployed system would never actually be asked to score in the first place. Recomputing every headline number restricted to only the rows a real deployment would ever see raised every model's error by roughly 0.25-0.29 MAE (every number reported up to that point had been measured against an easier-than-real population) — but the relative ranking between candidate formulas held, and the calibrated floor's bias advantage got *cleaner*, not weaker, on the realistic slice.
-4. **Outcome-level population filtering was explicitly rejected.** A tempting further step — excluding low trailing-points-average players from training, not just validation — was checked and found to be unsafe: roughly a quarter of genuinely established players who go on to play 60+ minutes in a given week have a trailing average under 2 points. These are real, legitimate low-output performances (defenders, defensive midfielders), not noise, and removing them from training would bias the model toward over-predicting everyone. The line drawn: filtering the *population* using information known before the outcome (trailing minutes, cumulative tenure) is safe; filtering training rows by their own *outcome* is not, regardless of how it's framed.
+1. **RotoWire starter** (next gameweek only) — overrides everything else.
+2. **Team has a published lineup but the player isn't in it** — a fixed low bench probability.
+3. Otherwise, and for every gameweek beyond the next: the **exponentially weighted start rate** (half-life 1.5 games), passed through a per-horizon logistic recalibration.
 
-### An open, acknowledged gap: point-wise error isn't decision quality
+How it got there:
 
-A more fundamental critique surfaced late in the project and is recorded here rather than papered over: every validation number in this report is a point-wise average error (MAE/RMSE/bias) across a set of rows, treating every row as equally important. But predictions here only matter through the downstream optimizer's *choices* — a large error on a player who was never a realistic pick is invisible to the optimizer, while a small error on two closely-priced, closely-ranked alternatives can flip a real transfer decision. Point-wise accuracy is a proxy for decision quality, not the same thing, and a model can improve on one while not moving the other.
-
-Two more direct measures were discussed as the correct way to close this gap, neither built yet:
-- **Ranking-based validation** (e.g., per-gameweek rank correlation, or top-N overlap between predicted and actual scorers among plausible candidates) — tests the property squad selection actually depends on, independent of absolute error size.
-- **A full walk-forward backtest through the actual optimizer** — simulate gameweek by gameweek using only past data, run the real squad-selection MILP, and score the *realized* points of the chosen squad against history. This is the only method that directly answers "did this modeling choice produce a better team," but requires deciding how to model an evolving squad/transfer state across simulated gameweeks, which was flagged as a real design decision rather than pure implementation work.
-
----
-
-## 6. Start-Probability & Lineup Integration
-
-The base start-probability signal is `trail_minutes5 / 90`, clipped to [0, 1] — a purely backward-looking proxy. This was upgraded with scraped RotoWire predicted/confirmed lineups, which carry forward-looking information no trailing statistic can (summer transfers, a new signing walking straight into the XI, this week's team news) — concretely, this is what correctly identifies a new signing as a club's starting goalkeeper on day one, a case the trailing-minutes proxy handled wrong before this fix.
-
-Priority order per player:
-1. **Confirmed/predicted lineup starter** — overrides the trailing proxy outright (not averaged with it; a confirmed lineup and a stale minutes trend aren't two votes of equal standing).
-2. **Team has a published lineup, player isn't in it** — treated as a firm "not starting" (a fixed low bench probability), catching cases where a player's historical minutes look fine but they've been squeezed out of the current XI entirely.
-3. **No lineup published yet for that team** — falls back to the trailing-minutes proxy.
-
-RotoWire only ever publishes the *next* upcoming gameweek's lineup. For multi-gameweek predictions, that single snapshot is carried forward and applied to every horizon in the window rather than reverting to the trailing-minutes proxy for weeks 2-4 — a confirmed current role at a club is judged more durable over a few weeks than the pre-season trailing trend it replaces.
+- The original proxy was `trail_minutes5 / 90`, then a 5-game starts fraction, which separates a 90-minute regular from one often subbed early.
+- RotoWire's single next-week snapshot used to be carried forward to all horizons; it now applies only to horizon 1. Carrying it forward gave every confirmed starter the same flat probability for weeks 2-4 regardless of their own reliability.
+- **Recalibration**: the raw rate was overconfident at both extremes, worse further out — rows at ~0 still played 60+ 13-19% of the time; rows at ~1.0 fell short 16-26%. A one-feature logistic map per horizon, validated out of sample, improved Brier score at every horizon (e.g. 0.242 → 0.210 at horizon 4).
+- **Recency weighting**: a flat 5-game window punished players who had just won a starting place (e.g. Konsa: 0, 11, 90, 90, 90 minutes → ~0.53). The EWM rate beat the 5-game fraction in **24 of 24** walk-forward fold × horizon cells (~5% lower Brier). Side effect: a single recent injury absence now weighs heavily.
+- A RotoWire double-fixture bug (a rearranged match live alongside next week's preview gave some players two rows) is resolved by matching on player *and* opponent.
 
 ---
 
-## 7. Cold-Start Filtering & Manual Additions
+## 6. Live Inference: Season Transition and New Players
 
-Per the design doc's explicit scope cut, players with no trustworthy Premier League track record — transfers from other leagues, promoted-team players, academy graduates — are excluded from the model and the optimizer's candidate pool **entirely**, at the data stage, rather than given a low or zero predicted score. The bar (fewer than 5 starts or 450 minutes in the prior PL season) is read from the historical archive and checked against the live squad on every run, so newly-promoted clubs and fresh transfers are excluded automatically without any manual list-keeping.
-
-Two deliberate, bounded carve-outs sit outside this filter, both explicitly *not* general mechanisms:
-
-- **A short, named list of newly-arrived players** the user wanted visible to the optimizer despite having no PL history. Prior-season output (goals/assists at their previous club) converts to a rough points-per-90 using standard FPL scoring values, then two judgment-call discount tables apply — how close the source league plays to the Premier League, and how well output at that specific position tends to travel across leagues (goals travel worst; defensive output travels best). These are explicitly documented as a conservative placeholder, never fed into GLM training, and meant to be dropped the moment a player accumulates real PL minutes.
-- **A small "enabler" pool** of cheap, cold-start-excluded players, re-surfaced purely as legal squad-filler — not as scored quality candidates. The cold-start filter correctly protects the quality model from untrustworthy predictions, but it also strips out the genuinely cheapest players at each position, leaving the optimizer with an artificially high budget floor. Enablers are scored by a flat nominal per-start value, split into "confirmed lineup starter" and "unconfirmed but available" confidence tiers, so a confirmed cheap starter still ranks above an unconfirmed one at the same price.
+- **Season blending**: early in 2026-27, live features blended last season's tail with this season's games (various weightings were tried). Once enough current-season games existed, the historical blend was **dropped entirely** — live features now use current-season rows only. The GLM itself is still fit on the complete 2025-26 season.
+- **New arrivals**: the original hand-curated discount table for players new to the league (`manual_additions.py`) is **superseded**. Any cold-start-excluded player automatically graduates into the main model once they have 30 real current-season minutes, scored like everyone else on their real data.
+- **Cold-start and enablers**: players with no trustworthy PL record are excluded from the scored pool at the data stage rather than given a zero score. A small pool of cheap excluded players is re-added as legal bench filler at a flat nominal value, so the optimizer isn't left with an artificially high price floor. Owned players who drop out of the scored pool (injured, unavailable) stay in the squad at zero projected points instead of vanishing.
 
 ---
 
-## 8. Squad Optimizer
+## 7. Optimizers
 
-A mixed-integer linear program (PuLP with the CBC solver), verified to reach a provably optimal solution (not a heuristic) via solver logs. Binary decision variables cover squad membership, starting-XI membership, and captaincy; the objective is a linear sum of predicted points, with the captain's points counted twice (once as a starter, once again as captain) and a small epsilon reward on bench predicted-points solely to break otherwise-indifferent ties in favor of the better bench option — never large enough to justify a worse starting XI to get it.
+### Single-period squad selector (`select_squad`)
 
-All squad-building rules — squad size, budget, formation min/max per position, per-club cap — are read live from the official FPL API's own rules tables rather than hardcoded, so a mid-season rule change would be picked up automatically. Cold-start-excluded players are absent from the candidate pool passed to the solver, not present with a zero score — matching the design doc's explicit requirement.
+A PuLP mixed-integer program over squad, XI and captain (captain counted twice), with all rules read live from the FPL API. It is still used for single-week questions such as the Free Hit check.
 
-**Multi-gameweek extension**: the objective sums predicted points across the next several gameweeks with a small per-week discount (default 0.95 — a judgment call, not fit to data, reflecting that a squad decided today has more certain value next week than four weeks out), plus a transfer-cost term when re-optimizing an existing squad rather than building from scratch. This combines the real FPL rule (a hard -4 point cost for any transfer beyond the free allowance) with a smaller, forward-looking *soft* cost on every transfer used, scaled by how many free transfers remain banked — zero at 5 free transfers, growing to roughly -1.5 with only one left, reflecting that spending your last banked transfer forecloses more future flexibility than spending a spare one.
+**Bench value**, replacing an earlier tie-break epsilon, is grounded in measured rates. A bench player only scores when a starter plays exactly 0 minutes. Among reliable starters, 7.6% still blanked the following week; for goalkeepers it was 4.4% in GW1-29 vs. 11.1% in the end-of-season run-in. An analysis of foreseeability (red cards, transfer-market spikes) found no foreseeable component to strip out. Outfield bench slots get the average of 12% / 5% / 2% rank weights; the bench GK gets 4.4%.
 
-No variance or risk penalty appears anywhere in the objective (a deliberate design-doc decision — best-EV players are rarely genuine bench risks), and rotation risk is never discounted twice: it's already priced once into `predicted_points` via the start-probability blend, so the optimizer's objective doesn't apply a second penalty on top.
+### Multi-period planner (`plan_transfers`) — the production decision engine
 
----
+One mixed-integer program over the next H gameweeks, with per-player, per-week squad / XI / captain / transfer variables and the **exact free-transfer rule** (+1 per week, cap 5; using more than banked costs 4 points each and leaves 1 next week). The objective is decayed weekly XI points plus bench value, minus hits, plus a small value per transfer still banked after the horizon. Only week 1 is executed; the whole thing is re-solved every week.
 
-## 9. Current Production Pipeline
+Other features:
+- **Transfer window**: transfers are only allowed in the first `transfer_weeks` of the plan, so late-window moves aren't judged on truncated payoff.
+- **Wildcard mode**: unlimited free transfers in week 1, with banked transfers kept.
+- **Pre-filtering**: the candidate pool is cut to ~110 players (top EV, top EV per £, and cheapest per position, plus everyone owned).
+- **Solver**: HiGHS, with identical plans to CBC at about 1.5-2× the speed.
+- **Owned-player guard**: the planner refuses to run if an owned player is missing from the pool; otherwise that player would be treated as sold for free.
 
-End to end, a live squad-selection run does the following:
+**Tuned settings**: horizon 8, decay 0.7, FT value 0.75, transfers allowed in the first 6 weeks (§8).
 
-1. Fetch fresh live data (squad, prices, fixtures, status, official rules) from the FPL API.
-2. Rebuild the cold-start eligibility list against the current live squad.
-3. Fetch current RotoWire lineups.
-4. Fit the 60+-minute NB2 GLM and the MAE-optimal floor constant (§4) once, on the complete historical season — no held-out fold, since this is genuine forward forecasting into gameweeks with no ground truth yet, not a backtest.
-5. Score every eligible candidate across the prediction horizon, blending the GLM's quality prediction with lineup-informed (or trailing-minutes-fallback) start probability and the calibrated floor.
-6. Add the manual-addition and enabler candidate pools (§7).
-7. Solve the multi-gameweek MILP over the combined pool under the live-fetched squad rules.
-
-The 3-term pipeline with its own sub-60 GLM (§3) was fully built and validated but was **not** adopted into production — it was statistically indistinguishable from the simpler, now-recalibrated 2-term formula, so the simpler design was kept per the project's standing bias against unearned complexity.
+This dissolves the problem that sank the earlier policy work: the squad trajectory itself is a decision variable, so choices like "bank this week to make a free double transfer later" come out of the optimization instead of needing a hand-built rule.
 
 ---
 
-## 10. Known Limitations / Open Items
+## 8. Transfer Policy and Chips: Backtesting and Tuning
 
-- Validation remains fundamentally point-wise (MAE/RMSE/bias over rows), not a direct measure of squad-selection decision quality. Ranking-based validation and a full optimizer backtest (§5) are the identified next steps, not yet built.
-- The leakage-safe "established/plausible candidate" population filter has been validated for reporting and for the smaller rate constant, but has not yet been extended to the GLMs' own training rows — flagged as a reasonable, safe next step (origin-time population filtering only, never outcome-based) but not yet implemented in production.
-- No systematic feature-selection/pruning pass has been performed on the GLM; not shown to be necessary, but also not rigorously ruled out.
-- Cold-start exclusion of promoted-team and new-to-PL players remains a deliberate scope cut per the original design doc, intended to be revisited once real current-season minutes accumulate for those players.
-- The design doc's "Option B" fixture-adjustment approach (a second-stage model learning a fixture-difficulty *ratio* rather than fixture difficulty as a direct input feature) was never pursued — the simpler Option A was sufficient and no evidence emerged that the added complexity was needed.
+### The backtest harness (`policy_backtest.py`)
+
+The harness replays the 2025-26 season:
+- **Weekly refit**: at each decision week the model is refit only on outcomes known by then.
+- **Decisions vs. scoring**: the policy decides using predicted points, and each week is scored on **realized** points (captain doubled, hits subtracted).
+- **Start**: the season begins from a fixed GW1 squad, chosen without the model by maximizing ownership within budget.
+
+Fixes along the way:
+- the weekly refit originally trained on outcomes up to four weeks in the future;
+- double gameweeks were predicted as one fixture but scored as two;
+- managers' free-transfer counts could go negative.
+
+Decisions start at GW6, the first week with enough known outcomes to fit a model.
+
+**The central methodological lesson: single replays are path-dependent.** A tiny prediction change flips one transfer, which changes every later week; season totals swing by roughly ±100 points. Policies are therefore compared over multiple seeds of small prediction jitter, with the same seeds for every policy so comparisons are paired. With 8 seeds, differences below roughly 45 points can't be resolved.
+
+### History of transfer policies
+
+1. **Soft-cost heuristic** (original): a single-week optimization with a hand-picked "cost of using a transfer" curve (−1.5 at one free transfer down to 0 at five). Never validated.
+2. **Threshold rules**: transfer only if the predicted gain clears a required margin, with families in weeks remaining and banked transfers (linear, then log-binomial in banked transfers, anchored at "a transfer with no free ones costs 4" and "the fifth banked transfer is worth ~0"). The best grid cell scored 1792 vs. 1630 for the heuristic — but after a small model change the ranking **reversed** (1681 vs. 1756). Every conclusion from that phase was within path-dependence noise and has been discarded. Along the way: the first transfer's predicted gain is almost always 2-11 points, so no tested threshold ever held back a free transfer; and a full dynamic program over the transfer bank is intractable because the true state includes the squad itself.
+3. **Research review**: the community-standard approach (Sertalp Çay's open-source FPL solver, FPLReview's solver) is a multi-period MILP with a small flat FT value (~1.5-1.75) and decay (~0.85). Their "sensitivity analysis" (vote over many noisy re-solves) was considered and **rejected**: with calibrated predictions it only moves the decision away from expected-value maximization, and no published evidence quantifies a gain.
+4. **Multi-period planner** (current, §7).
+
+### Results (2025-26, GW7-38, realized points)
+
+| Policy | Mean | Seed sd | vs. production |
+|---|---|---|---|
+| Production soft-cost heuristic | 1507 | 65 | — |
+| Planner, 4 weeks, default settings | 1567 | 47 | +60 ± 20 (6/8 seeds) |
+| Planner, 8 weeks, default settings | 1577 | 32 | +70 ± 22 (7/8 seeds) |
+| **Planner, tuned** | **1594** (seeds 0-7) | — | **+86 ± 32 (7/8 seeds)** |
+
+**Tuning** — a coordinate-descent sweep with 16 seeds, taking the best mean at each stage (the tuned planner averaged 1597 over 16 seeds):
+
+| Parameter | Values (mean points) | Chosen |
+|---|---|---|
+| Decay | 0.7: 1585, 0.8: 1578, 0.85: 1576, 0.9: 1574, 0.95: 1545, 1.0: 1512 | 0.7 |
+| FT value | 0: 1591, 0.75: 1595, 1.5: 1585, 2.25: 1588, 3.0: 1590 | 0.75 |
+| Transfer weeks | 1: 1580, 2: 1591, 4: 1592, 6: 1597, 8: 1595 | 6 |
+| Horizon | 4: 1559, 6: 1576, 8: 1597 | 8 |
+
+What the sweep showed:
+- **Discounting matters.** Too little hurts clearly: decay 0.95 cost 32 points and 1.0 cost 64.
+- **The 8-week horizon pays off only once decay is tuned.** It beats 4 weeks by 37 ± 13 at decay 0.7, but tied at the default 0.85.
+- **Most of the space is flat.** Decay 0.7-0.9, every FT value tested, and transfer weeks 2-8 are all within noise of each other.
+
+The tuned set is +20 ± 14 over the defaults. Both the chosen decay and the chosen horizon sit at the edge of their grids, so neither optimum is bracketed yet.
+
+### Chip thresholds
+
+**How they're derived**: first half of 2025-26, 8 seeds, along the tuned planner's trajectory. Gains are measured each week on un-jittered predictions:
+- **Wildcard**: planner objective with the chip minus without.
+- **Free Hit**: best one-week XI minus the planned XI.
+- **Bench Boost**: the planned bench's points.
+- **Triple Captain**: the planned captain's points.
+
+Each chip is then placed exactly once in GW8-19, at most one per gameweek, maximizing total gain. A chip's threshold is its gain in its scheduled week. The one-chip-per-week rule moved at least one chip off its best week in all 8 seeds. Thresholds are assumed to hold for the second half, when a fresh set of chips arrives (GW20).
+
+| Chip | Threshold | Seed sd | Old (obsolete) |
+|---|---|---|---|
+| Wildcard | 18.7 | 1.7 | 21.15 |
+| Bench Boost | 14.0 | 0.6 | 14.24 |
+| Free Hit | 9.2 | 1.0 | 11.23 |
+| Triple Captain | 8.3 | 0.1 | 8.77 |
+
+Three artifacts found and fixed in the first attempt:
+- starting from the ownership-based squad inflated the Wildcard (29.4);
+- measuring gains on jittered predictions let Wildcard and Free Hit cherry-pick lucky noise;
+- the free model-built starting week inflated Bench Boost (15.1).
+
+---
+
+## 9. Benchmarking Against Expert Squads (GW6)
+
+Two "expert" squads (the most-owned picks among 100 consistently top-1% managers, overall and among those wildcarding) were scored under our own model. Over 4 weeks:
+- **Our wildcard**: 187.4
+- **Expert wildcard squad**: 175.6
+- **Expert overall squad**: 171.3
+
+So the model thinks it's only ~3 points a week better — small relative to its own error. The large individual disagreements clustered into four patterns:
+
+1. **Strong recent output discounted.** Examples: Groß 47 points in 5 GWs, model MID rank 33; De Cuyper rank 31. Calibration analysis (§3) later showed this shrinkage is historically justified from GW14 on, but early season is untested.
+2. **Fixture-driven cheap picks.** A triple-up on Fulham's run against promoted sides, which the experts avoided.
+3. **Recently-nailed players under-rated.** Konsa, Muñoz; fixed by the EWM start rate.
+4. **Injury doubts weighted near zero.** João Pedro and Palmer at 75%; FPL's own chance-of-playing field isn't used yet.
+
+---
+
+## 10. Production Pipeline
+
+```bash
+python -m pipeline.recommend --refresh
+```
+
+1. Refresh the live FPL data and current-season gameweek history (both fail loudly rather than save partial data).
+2. Read `my_team.json` (`{"entry_id": 7592422}`) and fetch the manager's state from the FPL API:
+   - **Squad**: as of the last deadline. Upcoming-week transfers stay hidden until the deadline, and a Free Hit week reverts to the previous squad.
+   - **Bank**.
+   - **Free transfers**: replayed from transfer history.
+   - **Selling prices**: FPL keeps half of any rise, e.g. De Cuyper risen £0.5m sells for £4.7m.
+   - **Chips used.**
+3. Fit the GLM, floor and start-probability recalibration on the complete 2025-26 season; build current-season features; fetch RotoWire lineups.
+4. Score every eligible player for the next 8 gameweeks (blank weeks → 0, double gameweeks summed), add enablers, keep owned players at selling price.
+5. Solve the planner for transfers and for a wildcard squad; print the XI, captain, bench and week-by-week plan.
+6. Compare each chip's current gain to its threshold, check which chips remain in the current half, and recommend at most one.
+
+`SquadHistory.md` is the human-readable transfer log, refreshed from the API (the API is the source of truth — the hand-kept record once assumed a GW5 transfer that was never made).
+
+**Current state (GW6)**: 2 free transfers, £0.0m in the bank, £99.2m budget at selling prices.
+- **Recommended**: Szoboszlai and Anderson out, Ødegaard and Rudoni in.
+- **Planner's later moves**: Cherki (GW7), Murillo (GW8) and Kinsky (GW9).
+- **Chips**: no chip clears its threshold. The Wildcard gain is 5.4 against 18.7.
+
+---
+
+## 11. Known Limitations and Open Items
+
+- **One season of history.** Every model fit, policy comparison and threshold rests on 2025-26 alone; there is no truly held-out season.
+- **Early-season calibration is untested** (validation starts at GW14) — the period where the largest expert disagreements occur.
+- **Planner simplifications**:
+  - Owned players are priced at their selling price in every week, so a sell-then-rebuy inside a plan is costed at the selling price.
+  - The backtest uses a flat £100m budget at each week's prices.
+  - There are no auto-substitutions.
+- **Chip simplifications**: playing a chip doesn't alter the simulated trajectory, and the second half is assumed to share the first half's thresholds.
+- **Tuning edges**: decay 0.7 and horizon 8 are both at the edges of their grids.
+- **Not yet used**:
+  - FPL's `chance_of_playing_next_round` (injury percentages)
+  - Rolling window 8-10 (deferred)
+  - Accuracy of the saved RotoWire snapshots (needs a few more weeks of data)
+- **`requirements.txt` is incomplete.** It lists pandas, pyarrow and requests, but not pulp, highspy, statsmodels or scikit-learn.
+- **Design-doc items not pursued**: the second-stage fixture-ratio model ("Option B") and a variance/risk term in the objective. Neither has been shown to be needed.

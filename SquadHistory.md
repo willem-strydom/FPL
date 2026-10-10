@@ -1,14 +1,13 @@
 # Squad History — 2026-27 Season
 
 A record of the actual squad shipped each gameweek and the transfers made
-between them. This is the source of truth for "what squad do we actually
-have" — keep it updated after every *confirmed* real transfer, and treat
-anything marked PENDING as not yet known to have happened.
+between them. The live source of truth is now the FPL API for entry
+7592422 (`pipeline/fpl_entry.py`, used by `python -m pipeline.recommend`);
+this file is the human-readable log, refreshed from the API.
 
-Confidence key: **CONFIRMED** — willem stated this directly. **INFERRED** —
-not stated directly, but consistent with other confirmed facts (noted per
-entry) and not corrected across later turns. **PENDING** — recommended,
-not yet known to be executed.
+Confidence key: **CONFIRMED (API)** — read from the FPL entry endpoints.
+**CONFIRMED** — willem stated it directly. **PENDING** — recommended, not
+yet visible (upcoming-gameweek transfers stay hidden until the deadline).
 
 ---
 
@@ -19,8 +18,9 @@ not yet known to be executed.
 | 1 | 2026-08-21 | — (initial squad) | — | — | CONFIRMED |
 | 2 | 2026-08-28 | none | none | 0 | CONFIRMED (willem: "another gameweek went by and I didn't make any transfers") |
 | 3 | 2026-09-04 | none | none | 0 | CONFIRMED (same statement covers GW2 and GW3) |
-| 4 | 2026-09-12 | Pedro Porro, O'Nien, E.Le Fée | Calafiori, Thomas, Bobb | 3 | INFERRED — willem said "we have 1 free" transfer going into GW5, which only follows if all 3 GW4-recommended transfers were made (using all banked free transfers resets you to the baseline 1/week). Not directly confirmed, but consistent across every turn since and never corrected. |
-| 5 | 2026-09-18 | De Cuyper | Hall | 1 | PENDING — recommended, not yet confirmed as executed |
+| 4 | 2026-09-12 | Pedro Porro, O'Nien, E.Le Fée | Calafiori, Thomas, Bobb | 3 | CONFIRMED (API) — 3 transfers, no hit |
+| 5 | 2026-09-18 | none | none | 0 | CONFIRMED (API) — the recommended De Cuyper → Hall was not made; FT rolled |
+| 6 | — | Szoboszlai, Anderson | Ødegaard, Rudoni | 2 | PENDING — multi-period planner recommendation (2 FT available) |
 
 ---
 
@@ -30,14 +30,11 @@ not yet known to be executed.
 **Bench**: O'Nien, van Ewijk, Dubravka, Mheuka
 **Cost**: £100.0m
 
-## Squad as of GW4 (inferred current — see log above)
+## Squad as of GW5 (CONFIRMED via API)
 
-**Starting XI**: Haaland (C), B.Fernandes (VC), Gabriel, Calafiori, Mbeumo, Szoboszlai, Anderson, Thomas, Bobb, De Cuyper, Lammens
-**Bench**: van Ewijk, Georginio, Mheuka, Dubravka
-
-## Squad as of GW5 (if the pending transfer above is executed)
-
-Same as GW4, with De Cuyper → Hall.
+**Starting XI**: Haaland (C), Lammens (VC), Gabriel, De Cuyper, Calafiori, B.Fernandes, Mbeumo, Szoboszlai, Bobb, Anderson, Georginio
+**Bench**: Dubravka, Thomas, van Ewijk, Mheuka
+**Bank**: £0.0m | **Selling value**: £99.3m (De Cuyper has risen £0.5m but sells for £4.7m)
 
 ---
 

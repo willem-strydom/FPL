@@ -4,13 +4,13 @@ squad, plus the planner's wildcard squad.
     python -m pipeline.recommend            # use cached data
     python -m pipeline.recommend --refresh  # pull fresh live + current-season data first
 
-Your squad lives in my_team.json at the repo root:
+my_team.json at the repo root says whose squad to plan for, either
+    {"entry_id": 7592422}
+which pulls squad, bank, free transfers and selling prices from the FPL API
+(see fpl_entry), or a manual fallback
     {"squad": ["Haaland", "Thomas (Coventry City)", ...], "free_transfers": 1, "bank": 0.5}
-Names are FPL web names; add "(Team)" only where a web name is ambiguous.
-
-Budget is your squad's current prices plus bank. FPL's real selling price
-halves any price rise, so this slightly overstates what you can spend if
-players have risen since you bought them.
+with FPL web names ("(Team)" only where a name is ambiguous), priced at
+current buy prices.
 """
 import argparse
 import json
@@ -20,12 +20,25 @@ from pathlib import Path
 
 import pandas as pd
 
-from pipeline.optimizer import PLANNER_HORIZON, load_squad_rules, plan_transfers
+from pipeline.fpl_entry import fetch_entry_state
+from pipeline.optimizer import PLANNER_HORIZON, load_squad_rules, plan_transfers, select_squad
 from pipeline.predict_next_gw import POSITION_NAME, build_enabler_candidates, get_next_gameweek, predict_multi_gw
 from pipeline.storage import load_raw
 
 TEAM_FILE = Path(__file__).resolve().parent.parent / "my_team.json"
 BASE_COLS = ["code", "web_name", "team_name", "position_name", "price"]
+
+# Chip thresholds: the predicted gain a chip must offer before it's worth
+# playing. From the 25-26 first half on the tuned planner (8 seeds): per week,
+# WC = planner objective with vs without wildcard, FH = best one-week XI minus
+# the planned XI, BB = planned bench points, TC = planned captain points, all
+# on un-jittered predictions; then each chip placed once in GW8-19, at most one
+# per week, maximizing total gain; threshold = gain in its scheduled week
+# (seed sd: WC 1.7, FH 1.0, BB 0.6, TC 0.1). Assumed to hold for the second
+# half too. FPL gives a fresh set of chips from SECOND_HALF_START_GW.
+SECOND_HALF_START_GW = 20
+CHIP_LABELS = {"wildcard": "Wildcard", "freehit": "Free Hit", "bboost": "Bench Boost", "3xc": "Triple Captain"}
+CHIP_THRESHOLDS = {"wildcard": 18.7, "freehit": 9.2, "bboost": 14.0, "3xc": 8.3}
 
 
 def _norm(s: str) -> str:
@@ -104,6 +117,33 @@ def print_plan(res: dict, title: str, first_gw: int) -> None:
         print(f"  GW{first_gw + wk['week'] - 1}: {wk['free_transfers']} FT, {moves}{hit}, XI {wk['xi_points']:.1f}")
 
 
+def chip_report(pool: pd.DataFrame, normal: dict, wild: dict, rules: dict, chips_used: dict, gw: int) -> None:
+    """Each chip's predicted gain this week vs its threshold; recommend at most
+    one (FPL allows one chip per gameweek), only from this half's unused set."""
+    free_hit = select_squad(pool.assign(predicted_points=pool["predicted_points_gw1"]), rules=rules)
+    gains = {
+        "wildcard": wild["objective"] - normal["objective"],
+        "freehit": free_hit["starting_predicted_points"] - normal["plan"][0]["xi_points"],
+        "bboost": float(normal["bench"]["predicted_points"].sum()),
+        "3xc": float(normal["captain"]["predicted_points"]),
+    }
+    half = range(1, SECOND_HALF_START_GW) if gw < SECOND_HALF_START_GW else range(SECOND_HALF_START_GW, 39)
+    used = {name for event, name in chips_used.items() if event in half}
+
+    print(f"\n=== Chips (GW{gw}) ===")
+    candidates = []
+    for chip, label in CHIP_LABELS.items():
+        status = "used this half" if chip in used else "available"
+        margin = gains[chip] - CHIP_THRESHOLDS[chip]
+        if chip not in used and margin >= 0:
+            candidates.append((margin, label))
+        print(f"  {label:15s} gain {gains[chip]:5.1f} vs threshold {CHIP_THRESHOLDS[chip]:5.1f} ({status})")
+    if candidates:
+        print(f"  -> play {max(candidates)[1]} this week")
+    else:
+        print("  -> no chip clears its threshold this week")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--refresh", action="store_true", help="re-ingest live FPL and current-season data first")
@@ -118,19 +158,31 @@ def main() -> None:
 
     team = json.loads(args.team.read_text())
     players = live_player_table()
-    squad = resolve_squad(team["squad"], players)
-    free_transfers, bank = int(team["free_transfers"]), float(team.get("bank", 0.0))
+    if "entry_id" in team:
+        state = fetch_entry_state(int(team["entry_id"]))
+        squad, free_transfers, bank = state["squad"], state["free_transfers"], state["bank"]
+        selling, chips_used = state["selling_prices"], state["chips_used"]
+        print(f"squad from FPL entry {team['entry_id']} as of GW{state['as_of_gw']} deadline")
+    else:
+        squad = resolve_squad(team["squad"], players)
+        free_transfers, bank = int(team["free_transfers"]), float(team.get("bank", 0.0))
+        selling = players.set_index("code").loc[list(squad), "price"].to_dict()
+        chips_used = {}
 
     rules = load_squad_rules()
-    rules["budget"] = players.loc[players["code"].isin(squad), "price"].sum() + bank
+    rules["budget"] = sum(selling.values()) + bank
     pool = planning_pool(squad, players, PLANNER_HORIZON)
+    # Owned players are worth their selling price, not today's buy price.
+    owned = pool["code"].isin(squad)
+    pool.loc[owned, "price"] = pool.loc[owned, "code"].map(selling)
     gw = get_next_gameweek()
-    print(f"GW{gw} | {free_transfers} free transfer(s) | budget £{rules['budget']:.1f}m")
+    print(f"GW{gw} | {free_transfers} free transfer(s) | bank £{bank:.1f}m | budget £{rules['budget']:.1f}m")
 
-    print_plan(plan_transfers(pool, squad, free_transfers, horizon=PLANNER_HORIZON, rules=rules),
-               "Recommended transfers", gw)
-    print_plan(plan_transfers(pool, squad, free_transfers, horizon=PLANNER_HORIZON, rules=rules, wildcard=True),
-               "Wildcard squad", gw)
+    normal = plan_transfers(pool, squad, free_transfers, horizon=PLANNER_HORIZON, rules=rules)
+    wild = plan_transfers(pool, squad, free_transfers, horizon=PLANNER_HORIZON, rules=rules, wildcard=True)
+    print_plan(normal, "Recommended transfers", gw)
+    print_plan(wild, "Wildcard squad", gw)
+    chip_report(pool, normal, wild, rules, chips_used, gw)
 
 
 if __name__ == "__main__":
