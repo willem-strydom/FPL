@@ -66,8 +66,15 @@ def _parse_side(lst, side_label: str) -> list[dict]:
     """First 11 <li> entries in a lineup__list are the starting XI; any
     entries after that are the team's injury-report callouts (which repeat
     a subset of names with a simplified position code), not more starters.
+
+    Before RotoWire publishes a side's XI, its list holds only those
+    callouts (e.g. 3 names, some tagged OUT). Fewer than 11 entries means no
+    lineup yet: return nothing, so the side neither supplies "starters" nor
+    marks the rest of its squad as benched.
     """
     items = lst.find_all(class_="lineup__player")
+    if len(items) < 11:
+        return []
     starters = items[:11]
     rows = []
     for li in starters:
