@@ -3,8 +3,10 @@ squad, plus the planner's wildcard squad.
 
     python -m pipeline.recommend            # use cached data
     python -m pipeline.recommend --refresh  # pull fresh live + current-season data first
+    python -m pipeline.recommend --entry 1234567   # any team, by FPL team id
+    python -m pipeline.recommend --entry https://fantasy.premierleague.com/entry/1234567/event/6
 
-my_team.json at the repo root says whose squad to plan for, either
+Without --entry, my_team.json at the repo root says whose squad to plan for, either
     {"entry_id": 7592422}
 which pulls squad, bank, free transfers and selling prices from the FPL API
 (see fpl_entry), or a manual fallback
@@ -15,6 +17,7 @@ current buy prices.
 import argparse
 import json
 import logging
+import re
 import unicodedata
 from pathlib import Path
 
@@ -39,6 +42,18 @@ BASE_COLS = ["code", "web_name", "team_name", "position_name", "price"]
 SECOND_HALF_START_GW = 20
 CHIP_LABELS = {"wildcard": "Wildcard", "freehit": "Free Hit", "bboost": "Bench Boost", "3xc": "Triple Captain"}
 CHIP_THRESHOLDS = {"wildcard": 18.7, "freehit": 9.2, "bboost": 14.0, "3xc": 8.3}
+
+
+def parse_entry_id(value: str) -> int:
+    """An FPL team id, or any fantasy.premierleague.com link containing
+    /entry/<id>/ (the points page, transfers page, history page...)."""
+    value = value.strip()
+    if value.isdigit():
+        return int(value)
+    match = re.search(r"/entry/(\d+)", value)
+    if not match:
+        raise argparse.ArgumentTypeError(f"expected an FPL team id or a link containing /entry/<id>/, got {value!r}")
+    return int(match.group(1))
 
 
 def _norm(s: str) -> str:
@@ -148,6 +163,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--refresh", action="store_true", help="re-ingest live FPL and current-season data first")
     parser.add_argument("--team", type=Path, default=TEAM_FILE)
+    parser.add_argument("--entry", type=parse_entry_id,
+                        help="plan for any FPL team: team id or a link to the team (overrides --team)")
     args = parser.parse_args()
     logging.basicConfig(level=logging.WARNING)
 
@@ -156,7 +173,7 @@ def main() -> None:
         fpl_live.ingest()
         fpl_current_season.ingest()
 
-    team = json.loads(args.team.read_text())
+    team = {"entry_id": args.entry} if args.entry is not None else json.loads(args.team.read_text())
     players = live_player_table()
     if "entry_id" in team:
         state = fetch_entry_state(int(team["entry_id"]))
