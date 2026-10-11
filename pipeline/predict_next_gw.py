@@ -18,13 +18,15 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 import statsmodels.discrete.discrete_model as dm
-from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import HistGradientBoostingClassifier
 
 from pipeline.features import (
     MAX_HORIZON,
     MIN_ORIGIN_ROUND,
     POSITION_COLUMN,
+    START_MODEL_COLS,
     START_RATE_COL,
+    START_RATE_NEW_GAME_WEIGHT,
     _add_trailing_features,
     _origin_snapshot,
     build_horizon_table,
@@ -294,7 +296,7 @@ def fetch_lineup_data() -> tuple[pd.DataFrame, set]:
 
 def compute_p_plays_60(
     pool: pd.DataFrame, use_lineups: bool = True, lineup_data: tuple | None = None, trust_lineup: bool = True,
-    horizon: int = 1, recalibrators: dict | None = None,
+    horizon: int = 1, recalibrators: dict | None = None, next_week_start: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Start-probability blend, in priority order:
 
@@ -310,12 +312,15 @@ def compute_p_plays_60(
        goal, regardless of how many minutes he played last season
        elsewhere.
     3. No lineup published yet for that team, `use_lineups=False`, or
-       `trust_lineup=False` -> fall back to the exponentially weighted
-       start rate (START_RATE_COL, see features.py), recalibrated per
-       horizon. Starts rather than minutes, so a reliable 90-minute player
-       separates from one who starts but is often subbed early; recency-
-       weighted, so a player who just won a starting place isn't held back
-       by benchings earlier in the season.
+       `trust_lineup=False` -> fall back to the per-horizon start model
+       (fit_p60_recalibration) on START_MODEL_COLS: the exponentially
+       weighted start rate (recency-weighted, so a player who just won a
+       starting place isn't held back by benchings earlier in the season),
+       average minutes when starting (a full-90 regular vs one usually
+       subbed around the hour) and season start share (one recent gap
+       weighs less for an established starter). For weeks 2+, next week's
+       lineup (when published) is folded into the start rate as one more
+       game first.
 
     RotoWire only ever publishes a lineup for the *next* upcoming
     gameweek — there's no real GW2-4 lineup to fetch. `trust_lineup`
@@ -329,19 +334,38 @@ def compute_p_plays_60(
     one who never leaves the pitch). Callers that still want the old
     carry-forward behavior can pass trust_lineup=True for every horizon.
     """
-    trailing_p60 = pool[START_RATE_COL].clip(0, 1)
-    if recalibrators and horizon in recalibrators:
-        # The raw start rate is overconfident at both extremes, worse at
-        # longer horizons; this per-horizon logistic map (fit in
-        # fit_p60_recalibration) pulls it back to the observed rate. Never
-        # applied to a RotoWire-sourced probability below — that's real
-        # lineup evidence, not the estimator this was fit to correct.
-        model = recalibrators[horizon]
-        trailing_p60 = pd.Series(
-            model.predict_proba(trailing_p60.values.reshape(-1, 1))[:, 1], index=pool.index
-        )
-    p60 = trailing_p60.copy()
+    inputs = pool[START_MODEL_COLS].astype(float).copy()
+    inputs[START_RATE_COL] = inputs[START_RATE_COL].clip(0, 1)
+    model_horizon = pd.Series(horizon, index=pool.index)
     source = pd.Series("trailing_starts", index=pool.index)
+    if next_week_start is not None and horizon > 1:
+        # Next week's lineup is still evidence about the weeks after it:
+        # fold it into the start rate as one more game (`next_week_start`,
+        # by code: 1 = named to start, 0 = left out of a published lineup;
+        # see predict_multi_gw), then read it as a rate one week closer to
+        # the target. Fixes a one-game injury absence dragging a returning
+        # starter down for every later week. Archive walk-forward, actual
+        # next start flipped 10% of the time (RotoWire's starters actually
+        # started ~90% in GW5): Brier 0.2042 vs 0.2099 over horizons 2-8,
+        # gains concentrated in 2-5.
+        x = pool["code"].map(next_week_start)
+        known = x.notna()
+        rate = inputs[START_RATE_COL]
+        updated = START_RATE_NEW_GAME_WEIGHT * x + (1 - START_RATE_NEW_GAME_WEIGHT) * rate
+        inputs[START_RATE_COL] = rate.where(~known, updated)
+        model_horizon = model_horizon.where(~known, horizon - 1)
+        source = source.where(~known, "trailing_starts+lineup")
+    trailing_p60 = inputs[START_RATE_COL].copy()
+    if recalibrators:
+        # Start-probability model (fit_p60_recalibration): P(60+) per
+        # horizon from the start rate, minutes when starting and season start
+        # share. Never applied to a RotoWire-sourced probability below —
+        # that's real lineup evidence, not something this model estimates.
+        for h in model_horizon.unique():
+            rows = model_horizon == h
+            if h in recalibrators:
+                trailing_p60[rows] = recalibrators[h].predict_proba(inputs.loc[rows, START_MODEL_COLS])[:, 1]
+    p60 = trailing_p60.copy()
 
     if not use_lineups or not trust_lineup:
         pool = pool.copy()
@@ -349,7 +373,7 @@ def compute_p_plays_60(
         pool["p_plays_60_source"] = source
         return pool
 
-    probs, teams_with_lineup = lineup_data if lineup_data is not None else fetch_lineup_data()
+    probs, _ = lineup_data if lineup_data is not None else fetch_lineup_data()
 
     if not probs.empty:
         # RotoWire can carry more than one fixture per team at once — e.g. a
@@ -373,7 +397,12 @@ def compute_p_plays_60(
         p60 = p60.where(~has_lineup_entry, pool_key.map(lineup_map))
         source = source.where(~has_lineup_entry, "lineup_starter")
 
-        team_has_lineup = pool["team_name"].apply(normalize_team).isin(teams_with_lineup)
+        # A team only "has a lineup" for this gameweek if the lineup is for
+        # this fixture: mid-gameweek, RotoWire still shows the current
+        # round's previews for teams that haven't played yet, and those
+        # must not mark every player of theirs benched for the next round.
+        fixture_keys = set(probs["team"].apply(normalize_team) + "|" + probs["opponent_norm"])
+        team_has_lineup = (pool["team_name"].apply(normalize_team) + "|" + pool_opponent_norm).isin(fixture_keys)
         is_bench = team_has_lineup & ~has_lineup_entry
         p60 = p60.where(~is_bench, BENCH_PROB)
         source = source.where(~is_bench, "lineup_bench")
@@ -391,22 +420,27 @@ def compute_p_plays_60(
     return pool
 
 
-def fit_p60_recalibration(max_horizon: int = MAX_HORIZON) -> dict[int, LogisticRegression]:
-    """Per-horizon logistic recalibration of the start rate (START_RATE_COL)
-    against real played-60+ outcomes on the complete 25-26 history.
+def fit_p60_recalibration(max_horizon: int = MAX_HORIZON) -> dict[int, HistGradientBoostingClassifier]:
+    """Per-horizon start-probability model: P(plays 60+ at origin + h) from
+    START_MODEL_COLS (recent start rate, average minutes over the last few
+    starts, season start share), fit on real outcomes over the complete
+    25-26 history.
 
-    A raw start rate is overconfident at both extremes, increasingly so at
-    longer horizons (originally found on trail_starts5: rows at ~0 still
-    played 60+ 13-19% of the time, rows at ~1.0 fell short 16-26%). The
-    EWM rate plus this recalibration beat trail_starts5 plus the same
-    recalibration in 24/24 walk-forward fold x horizon Brier cells. Fit on
-    the full history for production.
+    History: a one-input logistic recalibration of the start rate alone was
+    used until 2026-10-11. It couldn't tell a full-90 regular back from one
+    injury-missed game (actual 60+ rate next week 0.84, it said 0.69) from a
+    starter usually subbed around the hour (actual 0.68, it said 0.85).
+    Shallow monotone GBM on the three inputs: walk-forward Brier 0.1952 vs
+    0.2045, better in 44/44 fold x horizon cells; a logistic model with
+    interaction terms was close behind (0.1955). Monotone-increasing in all
+    three inputs, so more starting can never lower the estimate.
     """
     hist_df = load_processed("player_gameweek_2025_26")
     df2 = _add_trailing_features(hist_df)
     origin = _origin_snapshot(df2)
     origin = origin[origin["round"] >= MIN_ORIGIN_ROUND]
     origin = origin[origin["trail_games5"] > 0]
+    origin[START_RATE_COL] = origin[START_RATE_COL].clip(0, 1)
     targets = hist_df.groupby(["element", "round"], as_index=False).agg(target_minutes=("minutes", "sum"))
 
     recalibrators = {}
@@ -417,10 +451,12 @@ def fit_p60_recalibration(max_horizon: int = MAX_HORIZON) -> dict[int, LogisticR
             targets, left_on=["element", "target_round"], right_on=["element", "round"],
             how="inner", suffixes=("", "_target"),
         )
-        y = (block["target_minutes"] >= 60).astype(float).values
-        x = block[START_RATE_COL].clip(0, 1).values.reshape(-1, 1)
-        model = LogisticRegression()
-        model.fit(x, y)
+        y = (block["target_minutes"] >= 60).astype(int).values
+        model = HistGradientBoostingClassifier(
+            max_depth=3, min_samples_leaf=200, learning_rate=0.05, max_iter=200, l2_regularization=1.0,
+            monotonic_cst=[1] * len(START_MODEL_COLS), early_stopping=False, random_state=0,
+        )
+        model.fit(block[START_MODEL_COLS].astype(float), y)
         recalibrators[h] = model
     return recalibrators
 
@@ -451,6 +487,7 @@ def _fit_production_models():
 def predict_gw(
     target_event: int, horizon: int = 1, res=None, train_cols=None, floor: float | None = None,
     use_lineups: bool = True, lineup_data: tuple | None = None, recalibrators: dict | None = None,
+    next_week_start: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Score the entire eligible candidate pool for one target gameweek
     (not just a top-N slice) — this is what the squad optimizer draws
@@ -496,7 +533,7 @@ def predict_gw(
     # docstring for the failure mode this fixes).
     pool = compute_p_plays_60(
         pool, use_lineups=use_lineups, lineup_data=lineup_data, trust_lineup=(horizon == 1),
-        horizon=horizon, recalibrators=recalibrators,
+        horizon=horizon, recalibrators=recalibrators, next_week_start=next_week_start,
     )
     pool["predicted_points"] = (
         pool["p_plays_60"] * pool["quality_pred"] + (1 - pool["p_plays_60"]) * floor
@@ -540,12 +577,21 @@ def predict_multi_gw(horizons: tuple[int, ...] = (1, 2, 3, 4), discount: float =
 
     per_gw = {}
     combined = None
-    for h in horizons:
+    next_week_start = None
+    for h in sorted(horizons):
         target_event = next_gw + h - 1
         gw_pool = predict_gw(
             target_event, h, res=res, train_cols=train_cols, floor=floor, lineup_data=lineup_data,
-            recalibrators=recalibrators,
+            recalibrators=recalibrators, next_week_start=next_week_start,
         )
+        if h == 1:
+            # Next week's lineup read (named starter 1, benched 0) carried
+            # into the start rate for every later week — see compute_p_plays_60.
+            lineup_rows = gw_pool["p_plays_60_source"].isin(["lineup_starter", "lineup_bench"])
+            next_week_start = (
+                (gw_pool.loc[lineup_rows, "p_plays_60_source"] == "lineup_starter").astype(float)
+                .groupby(gw_pool.loc[lineup_rows, "code"]).max()
+            )
         weight = discount ** (h - 1)
         gw_pool = gw_pool.rename(columns={
             "predicted_points": f"predicted_points_gw{h}",

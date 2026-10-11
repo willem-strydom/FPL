@@ -1,12 +1,12 @@
 # FPL Points Prediction & Team Optimization — Implementation Report
 
-*Last updated 2026-10-09 (2026-27 season, ahead of GW6).*
+*Last updated 2026-10-11 (2026-27 season, ahead of GW7).*
 
 This document summarizes what was built, validated, and shipped against the goals in [DesignDoc.md](DesignDoc.md): a points-prediction model and a mathematical-programming optimizer that turns it into weekly squad, transfer and chip decisions. It covers modeling, validation and system design rather than code, and deliberately records the dead ends, negative results and reversals — several of them are the reason the system looks the way it does.
 
 The short version of where things stand:
 
-- **Points model**: a Negative Binomial (NB2) GLM for points given 60+ minutes, trained on the complete 2025-26 season with horizons 1-8, combined with a separately estimated probability of playing 60+ minutes and a calibrated floor for everything else.
+- **Points model**: a Negative Binomial (NB2) GLM for points given 60+ minutes, trained on the complete 2025-26 season with horizons 1-8, combined with a separately modeled probability of playing 60+ minutes (recent start rate, minutes when starting, season start share) and a calibrated floor for everything else.
 - **Decisions**: a multi-period mixed-integer planner that schedules transfers over the next 8 gameweeks with the real free-transfer banking rules, tuned on a full-season backtest; chips are recommended against thresholds derived the same way.
 - **Weekly use**: `python -m pipeline.recommend --refresh` pulls the manager's actual squad from the FPL API and prints this week's transfers, the multi-week plan, a wildcard squad, and a chip check.
 
@@ -18,9 +18,9 @@ Several sources feed the system, kept structurally separate because they answer 
 
 - **Historical archive (2025-26, per gameweek)** — ~29,750 rows, all 38 gameweeks, 841 players, enriched with Understat xG/xA. This is the only data used to *train* models, because it has known outcomes.
 - **Live FPL API** (bootstrap-static, fixtures) — the current season's players, prices, ownership, fitness flags and the official squad rules (budget, formation limits, club cap). Rules are read live, never hardcoded.
-- **Current-season gameweek history** (FPL `element-summary` per player) — this season's per-gameweek rows, used to build live features. The ingest retries each player and refuses to save a partial pull: a transient network outage once overwrote good data with a pull missing 248 players, which would have silently degraded every prediction.
+- **Current-season gameweek history** (FPL `element-summary` per player) — this season's per-gameweek rows, used to build live features. The ingest retries each player and refuses to save a partial pull: a transient network outage once overwrote good data with a pull missing 248 players, which would have silently degraded every prediction. Fixtures that haven't been played yet are dropped: once a gameweek opens, the API lists every fixture in it at 0 minutes for every player, so a mid-gameweek run read Haaland and Rudoni (whose GW6 games were still to come) as having missed a game — Haaland's GW7 projection fell from 7.4 to 4.8 and the wildcard sold him.
 - **Manager entry** (FPL `entry` endpoints) — the user's actual squad, bank, chips used and transfer history (§10).
-- **RotoWire lineups** (scraped, within RotoWire's published terms) — predicted/confirmed XIs for the next gameweek, used only as a start-probability signal. Each fetch now also saves a dated snapshot, so lineup accuracy can eventually be backtested (previously each fetch overwrote the last).
+- **RotoWire lineups** (scraped, within RotoWire's published terms) — predicted/confirmed XIs for the next gameweek, used only as a start-probability signal. Each fetch also saves a dated snapshot. First accuracy check: of the 218 players RotoWire listed as GW5 starters the day before the deadline, 91% actually started.
 
 Everything is cached as Parquet under `data/raw/` and `data/processed/`. An automated validation pass checks the historical archive on every build (row counts, all gameweeks present, legitimate vs. duplicate double-gameweek rows, Understat coverage, no nulls in core fields).
 
@@ -37,14 +37,25 @@ The core table is **horizon-as-feature**: one row per (player, origin gameweek, 
 ### Features
 
 - **Playing-time trend**: `trail_minutes5` (mean minutes over the last 5 gameweeks, zeros included) and `trail_games5` (appearances, also the eligibility gate).
-- **Form rates (5 appearances)**: pooled per-90 rates — summed stat / summed minutes × 90, so a cameo goal isn't read as a 45-per-90 player — for points, xG, xA, xGA, plus a **DefCon hit rate** (share of recent appearances clearing the position's defensive-contribution bonus threshold: 10 for DEF, 12 for MID/FWD). The hit rate replaced raw DefCon per 90 because the bonus is a hard threshold, so expected bonus is linear in the hit probability, not the raw count. Below 30 pooled minutes a rate is treated as noise and the last reliable value is carried forward.
-- **Season-to-date rates**: expanding (not rolling) per-90 points, xG, xA and xGA, null under 90 season minutes. Added after the expert-team analysis (§9) as a longer-run "talent" read alongside 5-game form: walk-forward MAE 2.3926 → 2.3908, 4/6 folds.
+- **Form rates (5 appearances)**: pooled per-90 rates — summed stat / summed minutes × 90, so a cameo goal isn't read as a 45-per-90 player — for goals, assists, "points from everything else" (below), xGA, plus a **DefCon hit rate** (share of recent appearances clearing the position's defensive-contribution bonus threshold: 10 for DEF, 12 for MID/FWD). The hit rate replaced raw DefCon per 90 because the bonus is a hard threshold, so expected bonus is linear in the hit probability, not the raw count. Below 30 pooled minutes a rate is treated as noise and the last reliable value is carried forward.
+- **Season-to-date rates**: expanding (not rolling) per-90 xG, xA, xGA and points-from-everything-else, null under 90 season minutes. Added after the expert-team analysis (§9) as a longer-run "talent" read alongside 5-game form: walk-forward MAE 2.3926 → 2.3908, 4/6 folds.
 - **Fixture**: FPL's official difficulty rating (FDR) and home/away for the target fixture, plus position dummies and two clean-sheet interaction terms (§3).
 - **Data-quality flags**: unreliable form, missing Understat coverage, unreliable season-to-date rates — so the model can tell "genuinely low" from "not enough data". All three flag-then-fill steps live in one shared helper used by training, live scoring and the backtest.
 
 ### Feature pruning
 
 A VIF diagnosis found the attacking-output cluster (points, goals, BPS, ICT per 90, and Understat xG/xA duplicating FPL's own) badly collinear: goals per 90 carried a significantly *negative* coefficient. Dropping only the Understat pair didn't fix it; dropping the whole cluster did — every remaining coefficient took the expected sign (xG and xA positive and significant), walk-forward accuracy was unchanged, and BIC was the best of all candidates.
+
+**Goals and assists back in (GW7).** The collinearity came from points per 90 already *containing* goal and assist points. Splitting points into the goal/assist part and everything else (appearance, clean sheets, bonus, DefCon, cards) removes the overlap, so actual output can sit alongside the rest without fighting it. Tested variants (purged walk-forward, MAE vs 2.4056 for the xG/xA model):
+
+| Variant | MAE change | Folds | GW6-9 | Wrong-signed coefficients |
+|---|---|---|---|---|
+| Goals/assists replace xG/xA everywhere (no split) | −0.0073 ± 0.0024 | 6/6 | +0.0042 | 2 |
+| Same, with points split | −0.0075 ± 0.0025 | 6/6 | +0.0043 | 2 |
+| Split, goals/assists + season xG/xA | −0.0025 ± 0.0015 | 5/6 | +0.0017 | 2 |
+| **Split, 5-game goals/assists, season xG/xA (adopted)** | **−0.0027 ± 0.0017** | **6/6** | **+0.0004** | **0** |
+
+The GW6-9 column is a leave-one-block-out check with near-full training data. It shows the full swap's bigger overall gain is a mid-season effect: over a handful of games actual goals are mostly finishing noise, xG settles faster, and the swap only starts to win around GW10. The adopted version keeps xG/xA for the season-long read, uses actual goals/assists for recent form, has max VIF 3.0 and every attacking coefficient positive. The full swap is a candidate to revisit mid-season.
 
 ### Leakage-safe validation
 
@@ -79,6 +90,7 @@ Each of these was a reasonable idea, tested with the same walk-forward framework
 | Replace FDR with opponents' rolling xG for/against | Worse at every position (2.4161 vs 2.3926); rolling goals worse still (2.4359) |
 | Rolling window other than 5 (3-10) | 8-10 marginally better (2.3910 at 10), mostly DEF/GK; deferred because longer windows delay feature maturity early in a season |
 | GBM residual-boosting on top of the GLM | No gain (2.3941), won only 2/6 folds; worse, it applied a −1.95-point "correction" to Haaland — trees can't extrapolate to extreme players, so the most decision-relevant prediction was the most distorted |
+| GBM residual-boosting, retried properly (GW7) | LightGBM Poisson starting from the GLM's prediction (multiplicative correction), residuals cross-fit by player, ±15% cap, monotone variant. The first attempt's early stopping used a random holdout, which leaked: each outcome appears in up to 8 horizon rows. With a time-based holdout it stops after 1-48 rounds instead of 500. Still worse than the GLM (+0.0012 ± 0.0004, 1/6 folds), and its largest correction was still Haaland downward (−0.55) in weeks he outscored the GLM. Closed. |
 | Penalty-taker feature (cumulative penalty xG) | Significant, correctly signed coefficient but no accuracy gain — already captured by form rates |
 | xG/xA × defender interactions | Null; slightly worse for defenders themselves |
 | Separate 1-59-minute GLM (3-term pipeline) | Statistically tied with the 2-term formula; simpler version kept |
@@ -86,6 +98,8 @@ Each of these was a reasonable idea, tested with the same walk-forward framework
 ### Calibration checks
 
 Stratifying out-of-fold residuals by 5-game form, xGI and season-to-date output showed **no systematic under-prediction of in-form players** (calibration slopes 0.84-1.0; slopes below 1 mean predictions are if anything slightly too spread, not compressed). The one exception is in-form defenders (top quintile under-predicted by 0.33 ± 0.11 per game). The players an optimizer would buy — top 3 predicted per position each week — came in at −0.02 ± 0.12 points versus prediction: no detectable winner's curse. **Caveat:** the first validation fold starts at GW14, so early-season calibration is untested.
+
+**Is the model too skeptical of actual output?** (GW7, prompted by experts owning Groß, João Pedro, Palmer and Rogers.) Midfielders and forwards with 450+ minutes were grouped by how far their season goals plus assists exceed their xG plus xA. The most over-performing fifth came in at −0.02 ± 0.06 versus prediction, and no group was clearly under-predicted. With season xG in the model, season goals take a *negative* weight: over-performance against xG doesn't persist. So the shrinkage on players like Groß is supported by last season's data.
 
 ---
 
@@ -102,16 +116,30 @@ Refitting the floor on "established" players only made it unstable and worse: th
 In priority order per player:
 
 1. **RotoWire starter** (next gameweek only) — overrides everything else.
-2. **Team has a published lineup but the player isn't in it** — a fixed low bench probability.
-3. Otherwise, and for every gameweek beyond the next: the **exponentially weighted start rate** (half-life 1.5 games), passed through a per-horizon logistic recalibration.
+2. **Team has a published lineup for that fixture but the player isn't in it** — a fixed low bench probability.
+3. Otherwise, and for every gameweek beyond the next: a **per-horizon start model** — a shallow gradient-boosted classifier, constrained to be increasing in all three inputs:
+   - the **exponentially weighted start rate** (half-life 1.5 games);
+   - **average minutes over the last 5 starts** (a full-90 regular vs. a starter usually subbed around the hour);
+   - **season start share** (so one recent gap weighs less for an established starter).
+4. For weeks 2+, a published next-week lineup is first folded into the start rate as one more game (named = start, left out = no start), and the model one week closer to the target is used.
 
 How it got there:
 
 - The original proxy was `trail_minutes5 / 90`, then a 5-game starts fraction, which separates a 90-minute regular from one often subbed early.
 - RotoWire's single next-week snapshot used to be carried forward to all horizons; it now applies only to horizon 1. Carrying it forward gave every confirmed starter the same flat probability for weeks 2-4 regardless of their own reliability.
 - **Recalibration**: the raw rate was overconfident at both extremes, worse further out — rows at ~0 still played 60+ 13-19% of the time; rows at ~1.0 fell short 16-26%. A one-feature logistic map per horizon, validated out of sample, improved Brier score at every horizon (e.g. 0.242 → 0.210 at horizon 4).
-- **Recency weighting**: a flat 5-game window punished players who had just won a starting place (e.g. Konsa: 0, 11, 90, 90, 90 minutes → ~0.53). The EWM rate beat the 5-game fraction in **24 of 24** walk-forward fold × horizon cells (~5% lower Brier). Side effect: a single recent injury absence now weighs heavily.
-- A RotoWire double-fixture bug (a rearranged match live alongside next week's preview gave some players two rows) is resolved by matching on player *and* opponent.
+- **Recency weighting**: a flat 5-game window punished players who had just won a starting place (e.g. Konsa: 0, 11, 90, 90, 90 minutes → ~0.53). The EWM rate beat the 5-game fraction in **24 of 24** walk-forward fold × horizon cells (~5% lower Brier). Side effect: a single recent injury absence weighed heavily.
+- **The João Pedro case (GW7).** He started every game he was fit for, missed GW5 injured and returned in GW6, and the one-input model put him at 0.68 next week falling to 0.57. Last season's data showed what it was missing:
+
+  | Pattern (last 6 games) | Played 60+ next week | Old model | New model |
+  |---|---|---|---|
+  | 6 straight starts, 85+ min when starting | 0.89 | 0.85 | 0.90 |
+  | 6 straight starts, under 85 min when starting | 0.68 | 0.85 | 0.75 |
+  | One missed game, 85+ min when starting | 0.84 | 0.69 | 0.86 |
+
+  Minutes when starting also stands in for "absent through injury" vs "dropped", which the archive can't record directly. The three-input model beat the one-input recalibration in **44 of 44** fold × horizon cells (Brier 0.1952 vs 0.2045); a logistic model with interaction terms was a close second (0.1955). Trained on GW18+ only and tested on GW4-9, it was well calibrated next week (most nailed bin: predicted 0.94, actual 0.94) and slightly optimistic further out (0.90 vs 0.87 at four weeks). Even fully nailed players only reach 60+ minutes about 89% of the time next week and 77% eight weeks out (injuries, suspensions, rotation, early subs), so p(60+) sits well below managers' "90%+ to start".
+- **Lineup carry-over**: archive validation with the actual next start flipped 10% of the time (RotoWire's measured error): weeks 2-8 Brier 0.2000 → 0.1954 on top of the new model, better in 31/38 cells. Combined with the new model: 0.2099 → 0.1954.
+- A RotoWire double-fixture bug (a rearranged match live alongside next week's preview gave some players two rows) is resolved by matching on player *and* opponent. The same opponent matching now decides whether a team "has a lineup": mid-gameweek, RotoWire still shows the current round's lineups for teams yet to play, which would otherwise have marked all their players as benched for the next round.
 
 ---
 
@@ -231,10 +259,12 @@ Two "expert" squads (the most-owned picks among 100 consistently top-1% managers
 
 So the model thinks it's only ~3 points a week better — small relative to its own error. The large individual disagreements clustered into four patterns:
 
-1. **Strong recent output discounted.** Examples: Groß 47 points in 5 GWs, model MID rank 33; De Cuyper rank 31. Calibration analysis (§3) later showed this shrinkage is historically justified from GW14 on, but early season is untested.
+1. **Strong recent output discounted.** Examples: Groß 47 points in 5 GWs, model MID rank 33; De Cuyper rank 31. Calibration analysis (§3) later showed this shrinkage is historically justified, and the over-performance test (§3) found no under-prediction of players beating their xG.
 2. **Fixture-driven cheap picks.** A triple-up on Fulham's run against promoted sides, which the experts avoided.
 3. **Recently-nailed players under-rated.** Konsa, Muñoz; fixed by the EWM start rate.
 4. **Injury doubts weighted near zero.** João Pedro and Palmer at 75%; FPL's own chance-of-playing field isn't used yet.
+
+**Revisited at GW7.** Palmer and Rogers were already rated highly (MID #4 and #7) and lose out on budget and squad structure, not on prediction. João Pedro's gap was start probability, not output (§5): he moved from FWD #16 to #3 once the start model could tell an injury gap from being dropped. Groß rose to MID #8 (start reliability, and the goals/assists features) and is now this week's recommended transfer.
 
 ---
 
@@ -251,24 +281,27 @@ python -m pipeline.recommend --refresh
    - **Free transfers**: replayed from transfer history.
    - **Selling prices**: FPL keeps half of any rise, e.g. De Cuyper risen £0.5m sells for £4.7m.
    - **Chips used.**
-3. Fit the GLM, floor and start-probability recalibration on the complete 2025-26 season; build current-season features; fetch RotoWire lineups.
+3. Fit the GLM, floor and start-probability model on the complete 2025-26 season; build current-season features from played fixtures only; fetch RotoWire lineups.
 4. Score every eligible player for the next 8 gameweeks (blank weeks → 0, double gameweeks summed), add enablers, keep owned players at selling price.
 5. Solve the planner for transfers and for a wildcard squad; print the XI, captain, bench and week-by-week plan.
 6. Compare each chip's current gain to its threshold, check which chips remain in the current half, and recommend at most one.
 
 `SquadHistory.md` is the human-readable transfer log, refreshed from the API (the API is the source of truth — the hand-kept record once assumed a GW5 transfer that was never made).
 
-**Current state (GW6)**: 2 free transfers, £0.0m in the bank, £99.2m budget at selling prices.
-- **Recommended**: Szoboszlai and Anderson out, Ødegaard and Rudoni in.
-- **Planner's later moves**: Cherki (GW7), Murillo (GW8) and Kinsky (GW9).
-- **Chips**: no chip clears its threshold. The Wildcard gain is 5.4 against 18.7.
+**GW6 (made)**: Szoboszlai and Anderson out, Ødegaard and Rudoni in, as recommended; £1.5m left in the bank.
+
+**Current state (GW7, run mid-GW6 with one fixture still to play)**: 1 free transfer, £1.5m in the bank, £99.1m budget at selling prices.
+- **Recommended**: Bobb out, Groß in; captain Haaland.
+- **Planner's later moves**: Murillo (GW8), Van Hecke (GW9), Silva (GW10).
+- **Chips**: none clear their thresholds. Wildcard 11.6 against 18.7; Triple Captain on Haaland 8.2 against 8.3.
 
 ---
 
 ## 11. Known Limitations and Open Items
 
 - **One season of history.** Every model fit, policy comparison and threshold rests on 2025-26 alone; there is no truly held-out season.
-- **Early-season calibration is untested** (validation starts at GW14) — the period where the largest expert disagreements occur.
+- **Early-season calibration of the points model is untested** (validation starts at GW14) — the period where the largest expert disagreements occur. The start model has been checked early season (§5); the points model hasn't.
+- **Policy backtest uses the raw start rate**, not the start model, so backtested policies and chip thresholds predate both start-probability changes.
 - **Planner simplifications**:
   - Owned players are priced at their selling price in every week, so a sell-then-rebuy inside a plan is costed at the selling price.
   - The backtest uses a flat £100m budget at each week's prices.
@@ -278,6 +311,7 @@ python -m pipeline.recommend --refresh
 - **Not yet used**:
   - FPL's `chance_of_playing_next_round` (injury percentages)
   - Rolling window 8-10 (deferred)
-  - Accuracy of the saved RotoWire snapshots (needs a few more weeks of data)
-- **`requirements.txt` is incomplete.** It lists pandas, pyarrow and requests, but not pulp, highspy, statsmodels or scikit-learn.
+  - Season-to-date goals/assists in place of xG/xA (better from ~GW10 on; revisit mid-season)
+- **Understat is missing for the current season.** It isn't ingested for 2026-27, so the missing-Understat flag is set for every live player and shifts all quality predictions up by about 4% (same for everyone, so rankings barely move).
+- **`requirements.txt` is incomplete.** It lists pandas, pyarrow and requests, but not pulp, highspy, statsmodels or scikit-learn. LightGBM is installed in the venv for the hybrid experiment but nothing in the pipeline uses it.
 - **Design-doc items not pursued**: the second-stage fixture-ratio model ("Option B") and a variance/risk term in the objective. Neither has been shown to be needed.

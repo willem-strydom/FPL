@@ -59,7 +59,15 @@ _PER90_SOURCE_COLS = {
     "defensive_contribution": "form_defcon_per90",
     "understat_xG": "form_understat_xG_per90",
     "understat_xA": "form_understat_xA_per90",
+    "points_ex_ga": "form_points_ex_ga_per90",
 }
+
+# Points minus the goal and assist points inside them (appearance, clean
+# sheet, bonus, DefCon, cards...). Lets goals, assists and "everything else"
+# enter the GLM as three non-overlapping pieces instead of goals/assists
+# fighting total points for the same signal.
+GOAL_POINTS = {"GK": 10, "GKP": 10, "DEF": 6, "MID": 5, "FWD": 4}
+ASSIST_POINTS = 3
 
 # Not a per-90 rate — a rolling, position-thresholded hit rate: what fraction
 # of this player's last-5 appearances cleared their position's DefCon bonus
@@ -94,9 +102,19 @@ DEFCON_HIT_RATE_COL = "form_defcon_hit_rate"
 # it has the best BIC of every candidate tested. form_understat_xG_per90 is
 # still computed and still drives the understat_form_missing flag — dropping
 # it from FEATURE_COLUMNS doesn't remove that indicator's own value.
+#
+# Later (2026-10-10) the goals/assists collinearity was fixed at the source:
+# total points is replaced by points_ex_ga, so rolling goals and assists come
+# back in alongside it, and the 5-game xG/xA go out (season-to-date xG/xA
+# stay as the stable talent read). Purged walk-forward: MAE -0.0027 +/- 0.0017,
+# 6/6 folds, neutral at GW6-9, max VIF 3.0, every attacking coefficient
+# positive. Swapping season-to-date xG/xA for goals/assists too was a larger
+# gain overall but hurt early season (finishing noise over few games) and
+# brought back wrong-signed coefficients.
 _PRUNED_FOR_COLLINEARITY = {
-    "form_defcon_per90", "form_goals_per90", "form_bps_per90", "form_ict_per90",
+    "form_defcon_per90", "form_bps_per90", "form_ict_per90",
     "form_understat_xG_per90", "form_understat_xA_per90",
+    "form_points_per90", "form_xG_per90", "form_xA_per90",
 }
 
 # Season-to-date (expanding) per-90 rates: a longer-run "talent" read
@@ -107,7 +125,11 @@ _STD_SOURCE_COLS = {
     "expected_goals": "std_xG_per90",
     "expected_assists": "std_xA_per90",
     "expected_goals_conceded": "std_xGA_per90",
+    "points_ex_ga": "std_points_ex_ga_per90",
 }
+# std_points_per90 is still computed (it drives the std_unreliable flag) but
+# replaced in the GLM by std_points_ex_ga_per90 — see _PRUNED_FOR_COLLINEARITY.
+_STD_NOT_IN_MODEL = {"std_points_per90"}
 STD_MIN_MINUTES = 90
 
 # Exponentially weighted start rate — the start-probability signal used by
@@ -116,6 +138,19 @@ STD_MIN_MINUTES = 90
 # starting place isn't held back by benchings earlier in a flat 5-game window.
 START_RATE_COL = "starts_ewm"
 START_RATE_HALFLIFE = 1.5
+# Weight the EWM puts on one new game. compute_p_plays_60 uses it to fold next
+# week's RotoWire lineup into the start rate for weeks 2+ (so a player back
+# from a one-game injury and named to start isn't priced like a dropped one).
+START_RATE_NEW_GAME_WEIGHT = 1 - 0.5 ** (1 / START_RATE_HALFLIFE)
+
+# Inputs to the start-probability model (predict_next_gw.fit_p60_recalibration):
+# the recent start rate, average minutes over the last START_PROFILE_WINDOW
+# starts (/90: separates full-90 regulars from players usually subbed around
+# the hour), and the season start share (so one recent gap weighs less for an
+# established starter). Walk-forward Brier vs the start rate alone: 0.1952 vs
+# 0.2045, better in 44/44 fold x horizon cells.
+START_PROFILE_WINDOW = 5
+START_MODEL_COLS = [START_RATE_COL, "mins_when_starting", "season_start_share"]
 
 FEATURE_COLUMNS = [
     "horizon",
@@ -124,9 +159,9 @@ FEATURE_COLUMNS = [
     "value",
     "target_difficulty",
     "target_was_home",
-] + [c for c in _PER90_SOURCE_COLS.values() if c not in _PRUNED_FOR_COLLINEARITY] + [DEFCON_HIT_RATE_COL] + list(
-    _STD_SOURCE_COLS.values()
-)
+] + [c for c in _PER90_SOURCE_COLS.values() if c not in _PRUNED_FOR_COLLINEARITY] + [DEFCON_HIT_RATE_COL] + [
+    c for c in _STD_SOURCE_COLS.values() if c not in _STD_NOT_IN_MODEL
+]
 
 POSITION_COLUMN = "position"
 
@@ -146,6 +181,9 @@ def _add_trailing_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
     # fill out the rest of a fixed 5-game window. Never applied to training.
     if "season_weight" not in df.columns:
         df["season_weight"] = 1.0
+    df["points_ex_ga"] = (
+        df["total_points"] - df["position"].map(GOAL_POINTS) * df["goals_scored"] - ASSIST_POINTS * df["assists"]
+    )
 
     df["_w_minutes"] = df["minutes"] * df["season_weight"]
     df["_w_points"] = df["total_points"] * df["season_weight"]
@@ -192,6 +230,14 @@ def _add_trailing_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
         df[name] = rate.where(df["cum_minutes_to_date"] >= STD_MIN_MINUTES)
 
     df[START_RATE_COL] = grp["starts"].transform(lambda s: s.ewm(halflife=START_RATE_HALFLIFE).mean())
+    started_minutes = df["minutes"].where(df["starts"] == 1)
+    df["mins_when_starting"] = (
+        started_minutes.groupby(df["element"])
+        .transform(lambda s: s.dropna().rolling(START_PROFILE_WINDOW, min_periods=1).mean().reindex(s.index).ffill())
+        .fillna(0.0)
+        / 90
+    )
+    df["season_start_share"] = grp["starts"].transform(lambda s: s.expanding().mean())
 
     # Minutes-weighted (pooled), not a mean-of-per-match-rates: summing the raw
     # stat and the minutes separately over the window before dividing avoids a

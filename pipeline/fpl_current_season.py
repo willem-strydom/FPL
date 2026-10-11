@@ -122,8 +122,18 @@ def build_current_season_table() -> pd.DataFrame:
     players["position"] = players["element_type"].map(ELEMENT_TYPE_TO_POSITION)
     gw = gw.merge(players[["element", "code", "position"]], on="element", how="left")
 
-    fx = live_fixtures[["id", "team_h_difficulty", "team_a_difficulty"]].rename(columns={"id": "fixture"})
+    fx = live_fixtures[["id", "team_h_difficulty", "team_a_difficulty", "finished_provisional"]].rename(
+        columns={"id": "fixture"}
+    )
     gw = gw.merge(fx, on="fixture", how="left")
+    # Once a gameweek opens, the API lists every fixture in it for every
+    # player at 0 minutes, played or not. Mid-gameweek those placeholder rows
+    # read as a missed game (start rate, trailing minutes), so keep only
+    # fixtures that have actually been played.
+    unplayed = ~gw["finished_provisional"].fillna(False).astype(bool)
+    if unplayed.any():
+        logger.info("dropping %d rows for fixtures not yet played", int(unplayed.sum()))
+    gw = gw[~unplayed].drop(columns=["finished_provisional"])
     gw["was_home"] = gw["was_home"].astype(bool)
     gw["own_team_difficulty"] = gw["team_h_difficulty"].where(gw["was_home"], gw["team_a_difficulty"])
     gw = gw.drop(columns=["team_h_difficulty", "team_a_difficulty"])

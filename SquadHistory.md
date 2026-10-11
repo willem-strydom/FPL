@@ -20,7 +20,7 @@ yet visible (upcoming-gameweek transfers stay hidden until the deadline).
 | 3 | 2026-09-04 | none | none | 0 | CONFIRMED (same statement covers GW2 and GW3) |
 | 4 | 2026-09-12 | Pedro Porro, O'Nien, E.Le Fée | Calafiori, Thomas, Bobb | 3 | CONFIRMED (API) — 3 transfers, no hit |
 | 5 | 2026-09-18 | none | none | 0 | CONFIRMED (API) — the recommended De Cuyper → Hall was not made; FT rolled |
-| 6 | — | Szoboszlai, Anderson | Ødegaard, Rudoni | 2 | PENDING — multi-period planner recommendation (2 FT available) |
+| 6 | 2026-10-10 | Szoboszlai, Anderson | Ødegaard, Rudoni | 2 | CONFIRMED (API) — the planner's recommendation, no hit |
 
 ---
 
@@ -35,6 +35,12 @@ yet visible (upcoming-gameweek transfers stay hidden until the deadline).
 **Starting XI**: Haaland (C), Lammens (VC), Gabriel, De Cuyper, Calafiori, B.Fernandes, Mbeumo, Szoboszlai, Bobb, Anderson, Georginio
 **Bench**: Dubravka, Thomas, van Ewijk, Mheuka
 **Bank**: £0.0m | **Selling value**: £99.3m (De Cuyper has risen £0.5m but sells for £4.7m)
+
+## Squad as of GW6 (CONFIRMED via API)
+
+**Starting XI**: Haaland (C), Lammens (VC), Gabriel, De Cuyper, Calafiori, B.Fernandes, Mbeumo, Ødegaard, Bobb, Rudoni, Georginio
+**Bench**: Dubravka, Thomas, van Ewijk, Mheuka
+**Bank**: £1.5m | **Team value**: £99.7m
 
 ---
 
