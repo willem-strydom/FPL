@@ -1,12 +1,12 @@
 # FPL Points Prediction & Team Optimization — Implementation Report
 
-*Last updated 2026-10-11 (2026-27 season, ahead of GW7).*
+*Last updated 2026-10-19 (2026-27 season, ahead of GW8).*
 
 This document summarizes what was built, validated, and shipped against the goals in [DesignDoc.md](DesignDoc.md): a points-prediction model and a mathematical-programming optimizer that turns it into weekly squad, transfer and chip decisions. It covers modeling, validation and system design rather than code, and deliberately records the dead ends, negative results and reversals — several of them are the reason the system looks the way it does.
 
 The short version of where things stand:
 
-- **Points model**: a Negative Binomial (NB2) GLM for points given 60+ minutes, trained on the complete 2025-26 season with horizons 1-8, combined with a separately modeled probability of playing 60+ minutes (recent start rate, minutes when starting, season start share) and a calibrated floor for everything else.
+- **Points model**: a Negative Binomial (NB2) GLM for points given 60+ minutes, trained on the complete 2025-26 season plus 2022-24 premium attackers, with horizons 1-8 and a per-player adjustment shrunk toward the population, combined with a separately modeled probability of playing 60+ minutes (recent start rate, minutes when starting, season start share) and a calibrated floor for everything else.
 - **Decisions**: a multi-period mixed-integer planner that schedules transfers over the next 8 gameweeks with the real free-transfer banking rules, tuned on a full-season backtest; chips are recommended against thresholds derived the same way.
 - **Weekly use**: `python -m pipeline.recommend --refresh` pulls the manager's actual squad from the FPL API and prints this week's transfers, the multi-week plan, a wildcard squad, and a chip check.
 
@@ -16,7 +16,11 @@ The short version of where things stand:
 
 Several sources feed the system, kept structurally separate because they answer different questions:
 
-- **Historical archive (2025-26, per gameweek)** — ~29,750 rows, all 38 gameweeks, 841 players, enriched with Understat xG/xA. This is the only data used to *train* models, because it has known outcomes.
+- **Historical archive (2025-26, per gameweek)** — ~29,750 rows, all 38 gameweeks, 841 players, enriched with Understat xG/xA. This is the core training season, because it has known outcomes under the current rules.
+- **Earlier seasons (2022-23 to 2024-25, `extra_seasons.py`)** — the same vaastav mirror, with player ids kept season-specific so rolling features never cross a season boundary. FPL's own xG/xA only start in 2022-23. Only 2022-24 premium attackers are used in training (§3).
+  - **DefCon for earlier seasons.** FPL only began recording defensive contributions in 2025-26. Per-match clearances, blocks, interceptions, tackles and recoveries for 2024-25 come from FotMob (Opta-sourced), as published by [FPL-Core-Insights](https://github.com/olbauday/FPL-Core-Insights), which asks to be credited as the source.
+  - **Validation against FPL's official 2025-26 numbers:** the DefCon threshold is reproduced in 99.2% (DEF), 99.3% (MID) and 99.9% (FWD) of games, using *total* tackles (tackles won drops this to ~96%). 2024-25 is rescored to 2025-26 rules (+2 per hypothetical DefCon hit, 2,506 points in total).
+  - **Nothing earlier is usable:** FotMob's terms forbid automated access, FBref lost its Opta feed, and Fantasy Football Scout's backfill is members-only.
 - **Live FPL API** (bootstrap-static, fixtures) — the current season's players, prices, ownership, fitness flags and the official squad rules (budget, formation limits, club cap). Rules are read live, never hardcoded.
 - **Current-season gameweek history** (FPL `element-summary` per player) — this season's per-gameweek rows, used to build live features. The ingest retries each player and refuses to save a partial pull: a transient network outage once overwrote good data with a pull missing 248 players, which would have silently degraded every prediction. Fixtures that haven't been played yet are dropped: once a gameweek opens, the API lists every fixture in it at 0 minutes for every player, so a mid-gameweek run read Haaland and Rudoni (whose GW6 games were still to come) as having missed a game — Haaland's GW7 projection fell from 7.4 to 4.8 and the wildcard sold him.
 - **Manager entry** (FPL `entry` endpoints) — the user's actual squad, bank, chips used and transfer history (§10).
@@ -40,7 +44,7 @@ The core table is **horizon-as-feature**: one row per (player, origin gameweek, 
 - **Form rates (5 appearances)**: pooled per-90 rates — summed stat / summed minutes × 90, so a cameo goal isn't read as a 45-per-90 player — for goals, assists, "points from everything else" (below), xGA, plus a **DefCon hit rate** (share of recent appearances clearing the position's defensive-contribution bonus threshold: 10 for DEF, 12 for MID/FWD). The hit rate replaced raw DefCon per 90 because the bonus is a hard threshold, so expected bonus is linear in the hit probability, not the raw count. Below 30 pooled minutes a rate is treated as noise and the last reliable value is carried forward.
 - **Season-to-date rates**: expanding (not rolling) per-90 xG, xA, xGA and points-from-everything-else, null under 90 season minutes. Added after the expert-team analysis (§9) as a longer-run "talent" read alongside 5-game form: walk-forward MAE 2.3926 → 2.3908, 4/6 folds.
 - **Fixture**: FPL's official difficulty rating (FDR) and home/away for the target fixture, plus position dummies and two clean-sheet interaction terms (§3).
-- **Data-quality flags**: unreliable form, missing Understat coverage, unreliable season-to-date rates — so the model can tell "genuinely low" from "not enough data". All three flag-then-fill steps live in one shared helper used by training, live scoring and the backtest.
+- **Data-quality flags**: unreliable form and unreliable season-to-date rates — so the model can tell "genuinely low" from "not enough data". A missing-Understat flag was dropped as a feature (2026-10-19): its Understat rates had been pruned, it was 1 for every live player, and it duplicated the season columns once earlier seasons were added. All three flag-then-fill steps live in one shared helper used by training, live scoring and the backtest.
 
 ### Feature pruning
 
@@ -94,6 +98,36 @@ Each of these was a reasonable idea, tested with the same walk-forward framework
 | Penalty-taker feature (cumulative penalty xG) | Significant, correctly signed coefficient but no accuracy gain — already captured by form rates |
 | xG/xA × defender interactions | Null; slightly worse for defenders themselves |
 | Separate 1-59-minute GLM (3-term pipeline) | Statistically tied with the 2-term formula; simpler version kept |
+
+### Earlier seasons: premium attackers from 2022-24 (adopted 2026-10-19)
+
+The GLM now also trains on 2022-23 and 2023-24 games of midfielders and forwards priced £7.0m+ at the origin gameweek (8,218 rows, 51 players; DefCon is worth only ~0.1-0.2 points a game for them, so its absence there costs little). Each of those seasons gets its own intercept and price slope. Live rows and 2025-26 rows have those columns at 0, so the premium *level* is still learned from 2025-26. The extra rows teach how form, xG and fixtures move premium predictions; recent goals (0.030 → 0.054) and season xG (0.094 → 0.125) both strengthened.
+
+| Training data (purged walk-forward on 2025-26) | RMSE | Bias | £10m+ resid | ≤£5.5m / £5.5-7.5m resid | Top-3 realized per pick |
+|---|---|---|---|---|---|
+| 2025-26 only | 3.1249 | −0.08 | −0.42 | +0.08 / +0.04 | — |
+| + full 2024-25 | 3.1838 | −0.33 | −1.58 | +0.45 / +0.11 | −0.42 ± 0.13 |
+| + 2022-24 premiums | 3.1244 | −0.09 | −0.54 | +0.10 / +0.02 | +0.15 ± 0.05 |
+| **+ 2022-24 premiums, own price slope per season** | 3.1242 | −0.09 | **−0.28** | +0.09 / +0.03 | **+0.10 ± 0.04** |
+
+- **Season-ahead check.** With no 2025-26 rows in training at all, adding the premiums to 2024-25 improved the top-3 picks by +0.23 ± 0.07 and £7.5m+ MAE by −0.05 ± 0.02.
+- **Full 2024-25 rejected.** Even with its own intercept and price slope, it over-predicted 2025-26 premiums badly (a 2024-25-only model put Haaland at 8.8 vs 6.5 actual) and everyone by about 0.3. It also lowered MAE while biasing predictions down, a reminder that MAE rewards under-prediction of a right-skewed target; RMSE, per-band bias and the top-3 picks are the better guides here. Likely causes are Salah's record 2024-25 season and rule changes between seasons, and it may be worth revisiting with a per-event model.
+- **Not used for the floor or the start model**, which stay on 2025-26: a premium-only sample would skew a population constant and a start model.
+
+### Player-specific adjustment (adopted 2026-10-15)
+
+The GLM is population-only, so it can't learn that a particular player keeps beating or missing his prediction. Each player now gets a multiplier from his own one-week-ahead 60+ minute games this season: log(actual / predicted), with a points offset of 2, shrunk toward zero by n / (n + 80). This is empirical-Bayes partial pooling, the cheap version of a hierarchical player-ability model.
+
+Purged walk-forward, adjustments built only from games before each validation block:
+
+| Shrinkage k | MAE vs GLM | £7.5m+ MAE | Top-3 realized per pick |
+|---|---|---|---|
+| 20 | +0.0019 ± 0.0061 | +0.034 | +0.01 ± 0.06 |
+| 40 | −0.0008 ± 0.0037 | +0.018 | +0.11 ± 0.04 |
+| **80 (chosen on folds 1-3)** | −0.0012 ± 0.0021 | +0.010 | **+0.09 ± 0.05** |
+| 160 | −0.0008 ± 0.0012 | +0.005 | +0.08 ± 0.03 |
+
+An additive version behaved the same. The gain is in the picks: about +0.1 realized points per top-3 pick for any k ≥ 40, with MAE unchanged. **It does not fix the premium over-prediction.** Haaland's one-week-ahead errors flip sign from block to block (+1.8, −4.5, +1.4, −3.9, +6.4, +3.7), so there's no stable trait to learn, and premium MAE gets slightly worse. Bruno, by contrast, was under-predicted in every block last season. Only this season's games are used, matching what was validated, so the adjustment is near zero early on (±2% at GW7) and grows through the season. Carrying last season's player effects into this one is untested.
 
 ### Calibration checks
 
@@ -290,16 +324,19 @@ python -m pipeline.recommend --refresh
 
 **GW6 (made)**: Szoboszlai and Anderson out, Ødegaard and Rudoni in, as recommended; £1.5m left in the bank.
 
-**Current state (GW7, run mid-GW6 with one fixture still to play)**: 1 free transfer, £1.5m in the bank, £99.1m budget at selling prices.
-- **Recommended**: Bobb out, Groß in; captain Haaland.
-- **Planner's later moves**: Murillo (GW8), Van Hecke (GW9), Silva (GW10).
-- **Chips**: none clear their thresholds. Wildcard 11.6 against 18.7; Triple Captain on Haaland 8.2 against 8.3.
+**GW7 (made)**: no transfer; the free transfer was rolled (the planner's Ødegaard → Semenyo was worth almost nothing either way).
+
+**Current state (GW8)**: 2 free transfers, £1.5m in the bank, £99.1m budget at selling prices.
+- **Recommended**: De Cuyper out, Murillo in, keeping the second transfer; captain B.Fernandes.
+- **Haaland** is projected only 4.2 because of injury doubt (FPL 75%, RotoWire "questionable", so p(60+) 0.54); his points given 60+ minutes is still 7.8.
+- **Planner's later moves**: Van Hecke and Tonali (GW9), Hill (GW10), Verbruggen (GW11).
+- **Chips**: none clear their thresholds (Wildcard 8.7 against 18.7).
 
 ---
 
 ## 11. Known Limitations and Open Items
 
-- **One season of history.** Every model fit, policy comparison and threshold rests on 2025-26 alone; there is no truly held-out season.
+- **Mostly one season of history.** The GLM now also uses 2022-24 premium attackers (§3), but the floor, start model, policy comparisons and chip thresholds rest on 2025-26 alone, and the full 2024-25 season made predictions worse when added. The only held-out-season check is the season-ahead test in §3.
 - **Early-season calibration of the points model is untested** (validation starts at GW14) — the period where the largest expert disagreements occur. The start model has been checked early season (§5); the points model hasn't.
 - **Policy backtest uses the raw start rate**, not the start model, so backtested policies and chip thresholds predate both start-probability changes.
 - **Planner simplifications**:
@@ -315,3 +352,22 @@ python -m pipeline.recommend --refresh
 - **Understat is missing for the current season.** It isn't ingested for 2026-27, so the missing-Understat flag is set for every live player and shifts all quality predictions up by about 4% (same for everyone, so rankings barely move).
 - **`requirements.txt` is incomplete.** It lists pandas, pyarrow and requests, but not pulp, highspy, statsmodels or scikit-learn. LightGBM is installed in the venv for the hybrid experiment but nothing in the pipeline uses it.
 - **Design-doc items not pursued**: the second-stage fixture-ratio model ("Option B") and a variance/risk term in the objective. Neither has been shown to be needed.
+
+### Premium-player error: what's been ruled out, and the roadmap (2026-10-15)
+
+**The problem.** Out-of-sample, the highest predictions run high: the top 1% by about 1.2 points, mostly Haaland (−0.98) and Salah (−0.90), the only £12m+ players last season. £7.5-10m players run about 0.5 low. The weekly top 3 per position are still unbiased (−0.00 ± 0.24), so this is about levels at the top, not ranking within a position. It matters for premium-vs-spread decisions and captaincy margins.
+
+**Tried and rejected** (all purged walk-forward):
+- **Price shape:** log price, an extra slope above £9m, a spline, price above the positional floor (identical by construction), and per-position price slopes.
+- **Price-move features:** rise/fall flags or £ change over the last 1-2 GWs. A tiny, consistent gain (−0.0025, 6/6 folds), but no gain in picks.
+- **Dropping price:** much worse (top-3 −0.39 per pick).
+- **Price fading through the season:** price matters just as much late as early.
+- **Link function:** square-root or identity instead of log.
+- **Rebalancing training rows:** weights by price or ownership, dropping low-minute rows, premium-tier slopes, and 50% dropout of under-£6m rows. Price weighting improves £7.5m+ MAE (−0.03 to −0.04) but costs overall accuracy and picks.
+
+**Roadmap from a review of professional and academic practice**, in order of expected impact:
+1. **Multi-season training.** *Partly done (2026-10-19, §1, §3): 2022-24 premium attackers adopted; full 2024-25 tested and rejected.* OpenFPL trains on four seasons and matches FPL Review's paid model, beating it for 3+ point returns ([arXiv 2508.09992](https://arxiv.org/html/2508.09992v1)). Our one-season rule (DesignDoc) leaves two £12m+ players. Needs older vaastav and Understat seasons, rescoring or season indicators for rule changes (DefCon only from 2025-26), and season-held-out validation.
+2. **Player-specific adjustment, pulled toward the average.** Hierarchical football models give each player an ability shrunk toward the population ([Whitaker et al.](https://arxiv.org/pdf/1710.00001)). A population-only GLM can't learn a player's persistent over- or under-prediction. Cheap version: empirical-Bayes shrinkage of each player's residual. **Done (2026-10-15), see §3:** it improves picks but doesn't fix the premium level error.
+3. **Per-event model.** Model goals, assists, clean sheets, bonus and minutes separately and combine them with the scoring rules (FPL Review; AIrsenal's team-scoreline × player-involvement split). Lets finishing be shrunk properly: xG per 90 carries over season to season about 0.6, finishing above xG about 0.1 ([Evidently](https://evidently.substack.com/p/how-can-we-tell-if-a-footballer-will), [Stats Perform](https://www.statsperform.com/resource/re-examining-finishing-skill)).
+4. **Bookmaker odds** (anytime-goalscorer, clean-sheet markets). The commercial gold standard, but player-prop feeds are paid and need history.
+- **Cheap tweaks:** outcome-binned sample weights, balanced across score bins and clipped at the 95th percentile (OpenFPL); form windows of 1, 3, 5, 10 and 38 games alongside the current ones.

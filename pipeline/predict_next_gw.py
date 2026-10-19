@@ -462,7 +462,8 @@ def fit_p60_recalibration(max_horizon: int = MAX_HORIZON) -> dict[int, HistGradi
 
 
 def _fit_production_models():
-    """Fit all three production pieces once on the full 25-26 history: the
+    """Fit all three production pieces once on the full 25-26 history (the
+    GLM also gets 2022-24 premium attackers, see extra_seasons): the
     60+ NB2 GLM, the MAE-optimal floor for everything below it (see
     fit_floor_mae_optimal), and the per-horizon p_plays_60 recalibration
     (see fit_p60_recalibration). Reused across every horizon in
@@ -473,21 +474,80 @@ def _fit_production_models():
     """
     from pipeline.features import feature_matrix
 
+    from pipeline.extra_seasons import premium_training_table, season_columns
+
     hist_df = load_processed("player_gameweek_2025_26")
     full_df = build_horizon_table(hist_df, target_min_minutes=0)
     X_full, _ = feature_matrix(full_df)
 
+    # GLM: 25-26 60+ rows plus 2022-24 premium MID/FWD rows with their own
+    # season intercepts and price slopes (see extra_seasons). The floor and
+    # the start model stay on 25-26 only: premium-only seasons would skew a
+    # population-level constant and a start model.
     train_60 = (full_df["target_minutes"] >= 60).values
-    res, train_cols = fit_production_glm(full_df[train_60], X_full[train_60])
+    premium = premium_training_table()
+    X_premium, _ = feature_matrix(premium)
+    X_train = pd.concat([
+        pd.concat([X_full[train_60], season_columns(full_df[train_60])], axis=1),
+        pd.concat([X_premium, season_columns(premium)], axis=1),
+    ], ignore_index=True).fillna(0.0)
+    y_train = pd.concat([full_df.loc[train_60, ["target_points"]], premium[["target_points"]]], ignore_index=True)
+    res, train_cols = fit_production_glm(y_train, X_train)
     floor = fit_floor_mae_optimal(full_df, X_full, res)
     recalibrators = fit_p60_recalibration()
     return res, train_cols, floor, recalibrators
 
 
+PLAYER_ADJUST_K = 80
+
+
+def fit_player_adjustments(res, train_cols) -> pd.Series:
+    """Per-player correction for persistent model error this season:
+    log(sum(actual + offset) / sum(predicted + offset)) over the player's
+    one-week-ahead 60+ minute games so far, shrunk toward 0 by
+    n / (n + PLAYER_ADJUST_K). Returned by `code`, applied multiplicatively
+    to quality_pred in predict_gw.
+
+    The GLM is population-only: two players with the same features get the
+    same prediction, so it can't learn that one player keeps beating it.
+    Purged walk-forward on 25-26 (adjustments from games before each
+    validation block): top 3 per position per week scored +0.09 ± 0.05
+    points more (+0.11 ± 0.04 at k=40), MAE neutral (-0.0012 ± 0.0021);
+    k=80 chosen on folds 1-3. It does not fix the premium over-prediction:
+    Haaland's block-to-block errors swing sign, so there's no stable trait to
+    learn. Only this season's games are used (that is what was validated),
+    so the effect is near zero early on and grows as games accumulate.
+    """
+    from pipeline.features import feature_matrix
+    from pipeline.fpl_current_season import build_current_season_table
+
+    current = build_current_season_table()
+    if current.empty:
+        return pd.Series(dtype=float)
+    h1 = build_horizon_table(current, horizons=(1,))
+    if h1.empty:
+        return pd.Series(dtype=float)
+    X, _ = feature_matrix(h1)
+    X = sm.add_constant(X.drop(columns=[GLM_DROP_COL]).astype(float), has_constant="add")
+    X = X.reindex(columns=train_cols, fill_value=0.0)
+    games = pd.DataFrame({
+        "code": h1["code"].values,
+        "actual": h1["target_points"].values + GLM_OFFSET,
+        "predicted": np.asarray(res.predict(X)),
+    }).groupby("code").agg(n=("actual", "size"), actual=("actual", "sum"), predicted=("predicted", "sum"))
+    weight = games["n"] / (games["n"] + PLAYER_ADJUST_K)
+    adjust = weight * np.log(games["actual"] / games["predicted"])
+    logger.info(
+        "player adjustments: %d players, up to %d games each, largest |multiplier - 1| %.3f",
+        len(adjust), int(games["n"].max()), float(np.expm1(adjust.abs()).max()),
+    )
+    return adjust
+
+
 def predict_gw(
     target_event: int, horizon: int = 1, res=None, train_cols=None, floor: float | None = None,
     use_lineups: bool = True, lineup_data: tuple | None = None, recalibrators: dict | None = None,
-    next_week_start: pd.Series | None = None,
+    next_week_start: pd.Series | None = None, player_adjust: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Score the entire eligible candidate pool for one target gameweek
     (not just a top-N slice) — this is what the squad optimizer draws
@@ -519,6 +579,9 @@ def predict_gw(
     pred = np.asarray(res.predict(Xp)) - GLM_OFFSET
     pool = pool.copy()
     pool["quality_pred"] = pred  # E[points | plays 60+ min] — the piece this GLM actually models
+    if player_adjust is not None:
+        adjust = pool["code"].map(player_adjust).fillna(0.0).values
+        pool["quality_pred"] = (pool["quality_pred"] + GLM_OFFSET) * np.exp(adjust) - GLM_OFFSET
 
     # DesignDoc.md's formula is E[points] = P(60+min)*E[points|60+min] + ...,
     # with start probability explicitly "sourced from data directly ...
@@ -571,6 +634,7 @@ def predict_multi_gw(horizons: tuple[int, ...] = (1, 2, 3, 4), discount: float =
     is preferred over reverting to the trailing-minutes proxy for GW2-4.
     """
     res, train_cols, floor, recalibrators = _fit_production_models()
+    player_adjust = fit_player_adjustments(res, train_cols)
     lineup_data = fetch_lineup_data()
     next_gw = get_next_gameweek()
     logger.info("next gameweek is GW%d — targeting GW%d-%d", next_gw, next_gw, next_gw + max(horizons) - 1)
@@ -582,7 +646,7 @@ def predict_multi_gw(horizons: tuple[int, ...] = (1, 2, 3, 4), discount: float =
         target_event = next_gw + h - 1
         gw_pool = predict_gw(
             target_event, h, res=res, train_cols=train_cols, floor=floor, lineup_data=lineup_data,
-            recalibrators=recalibrators, next_week_start=next_week_start,
+            recalibrators=recalibrators, next_week_start=next_week_start, player_adjust=player_adjust,
         )
         if h == 1:
             # Next week's lineup read (named starter 1, benched 0) carried

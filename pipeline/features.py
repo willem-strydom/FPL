@@ -387,7 +387,11 @@ def feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     and return (X, feature_names). Same encoding used for both the GLM and
     the GBM for a fair comparison.
     """
-    cols = FEATURE_COLUMNS + ["understat_form_missing", "form_unreliable", "std_unreliable"]
+    # understat_form_missing is still set by fill_missing_form but no longer a
+    # feature: the Understat rates it flagged were pruned, Understat isn't
+    # ingested for the current season (so it was 1 for every live player) or
+    # for the extra training seasons (where it duplicated the season columns).
+    cols = FEATURE_COLUMNS + ["form_unreliable", "std_unreliable"]
     X = df[cols].copy()
     X["target_was_home"] = X["target_was_home"].astype(int)
     pos_dummies = pd.get_dummies(df[POSITION_COLUMN], prefix="pos", dtype=int)
