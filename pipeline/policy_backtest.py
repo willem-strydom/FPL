@@ -16,9 +16,14 @@ replay is path-dependent (tiny prediction changes flip later transfers, and
 season totals swing ~±100), so compare policies with compare(): several
 seeds of prediction jitter, the same seeds for every policy.
 
-Known simplifications: p60 is the raw start rate (no recalibration), no
-chips, no auto-subs, flat £100m budget at each week's prices, and scoring
-starts at the first week with enough known outcomes to fit the model.
+The weekly model mirrors production: the GLM trains on 25-26 rows plus the
+2022-24 premium attackers (all from before the season, so nothing leaks),
+the player adjustment uses games known by the decision round, and the start
+model is refit each week on outcomes known by then.
+
+Known simplifications: no RotoWire lineups (so no next-week lineup carry-
+over), no chips, no auto-subs, flat £100m budget at each week's prices, and
+scoring starts at the first week with enough known outcomes to fit the model.
 """
 import logging
 
@@ -29,6 +34,7 @@ import pulp
 from pipeline.features import (
     MAX_HORIZON,
     MIN_ORIGIN_ROUND,
+    START_MODEL_COLS,
     START_RATE_COL,
     _add_trailing_features,
     _origin_snapshot,
@@ -48,7 +54,13 @@ from pipeline.optimizer import (
     plan_transfers,
     select_squad,
 )
-from pipeline.predict_next_gw import fit_floor_mae_optimal, fit_production_glm
+from pipeline.predict_next_gw import (
+    fit_floor_mae_optimal,
+    fit_production_glm,
+    fit_start_models,
+    player_adjustments_from,
+    with_premium_seasons,
+)
 from pipeline.storage import load_processed
 from pipeline.two_stage_pipeline import _predict_with_fitted_glm
 
@@ -99,6 +111,7 @@ class SeasonBacktest:
     def __init__(self, season_table: str = "player_gameweek_2025_26"):
         hist = load_processed(season_table)
         hist["kickoff_time"] = pd.to_datetime(hist["kickoff_time"])
+        self.hist = hist
 
         origin = _origin_snapshot(_add_trailing_features(hist))
         origin["price"] = origin["value"] / 10.0
@@ -146,12 +159,22 @@ class SeasonBacktest:
         if train.sum() < MIN_TRAINING_ROWS:
             return None
         train_60 = train & (self.horizon_df["target_minutes"] >= 60).values
-        res, _ = fit_production_glm(self.horizon_df[train_60], self.X_glm[train_60])
+        y_train, X_train = with_premium_seasons(self.horizon_df[train_60], self.X_glm[train_60])
+        res, train_cols = fit_production_glm(y_train, X_train)
         floor = fit_floor_mae_optimal(self.horizon_df[train], self.X_glm[train], res)
 
         Xp, _ = feature_matrix(pool)
         quality = _predict_with_fitted_glm(res, Xp, GLM_OFFSET)
-        p60 = pool[START_RATE_COL].clip(0, 1).values
+        h1_known = train_60 & (self.horizon_df["horizon"] == 1).values
+        adjust = player_adjustments_from(self.horizon_df[h1_known], res, train_cols)
+        quality = (quality + GLM_OFFSET) * np.exp(pool["code"].map(adjust).fillna(0.0).values) - GLM_OFFSET
+
+        start_models = fit_start_models(self.hist, max_target_round=r)
+        p60 = pool[START_RATE_COL].clip(0, 1).values.copy()
+        for h, model in start_models.items():
+            rows = (pool["horizon"] == h).values
+            if rows.any():
+                p60[rows] = model.predict_proba(pool.loc[rows, START_MODEL_COLS].astype(float))[:, 1]
         pool = pool.assign(pp=p60 * quality + (1 - p60) * floor)
 
         # Blank weeks -> 0; double gameweeks -> sum of both fixtures.

@@ -63,6 +63,27 @@ def get_next_gameweek() -> int:
     return int(unfinished.min())
 
 
+_PREMIUM_CACHE: tuple | None = None
+
+
+def with_premium_seasons(table: pd.DataFrame, X: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """GLM training set: these 25-26 rows plus the 2022-24 premium MID/FWD
+    rows, with the premium seasons' own intercept and price-slope columns (0
+    for 25-26 rows). Returns (frame with target_points, X)."""
+    global _PREMIUM_CACHE
+    from pipeline.extra_seasons import premium_training_table, season_columns
+    from pipeline.features import feature_matrix
+
+    if _PREMIUM_CACHE is None:
+        premium = premium_training_table()
+        X_premium, _ = feature_matrix(premium)
+        _PREMIUM_CACHE = (premium[["target_points"]], pd.concat([X_premium, season_columns(premium)], axis=1))
+    y_premium, X_premium = _PREMIUM_CACHE
+    X_train = pd.concat([pd.concat([X, season_columns(table)], axis=1), X_premium], ignore_index=True).fillna(0.0)
+    y_train = pd.concat([table[["target_points"]], y_premium], ignore_index=True)
+    return y_train, X_train
+
+
 def fit_production_glm(horizon_df: pd.DataFrame, X: pd.DataFrame):
     """NB2 GLM trained on the full 25-26 horizon table — no held-out fold,
     since this is used to forecast forward into unseen fixtures, not to
@@ -436,6 +457,20 @@ def fit_p60_recalibration(max_horizon: int = MAX_HORIZON) -> dict[int, HistGradi
     three inputs, so more starting can never lower the estimate.
     """
     hist_df = load_processed("player_gameweek_2025_26")
+    return fit_start_models(hist_df, max_horizon=max_horizon)
+
+
+START_MODEL_MIN_ROWS = 2000
+
+
+def fit_start_models(
+    hist_df: pd.DataFrame, max_horizon: int = MAX_HORIZON, max_target_round: int | None = None,
+) -> dict[int, HistGradientBoostingClassifier]:
+    """The per-horizon start models of fit_p60_recalibration, fit on one
+    season's player log. `max_target_round` keeps only outcomes known by that
+    round (the season backtest refits weekly with it); a horizon with fewer
+    than START_MODEL_MIN_ROWS rows is skipped, and callers fall back to the
+    raw start rate for it."""
     df2 = _add_trailing_features(hist_df)
     origin = _origin_snapshot(df2)
     origin = origin[origin["round"] >= MIN_ORIGIN_ROUND]
@@ -451,6 +486,10 @@ def fit_p60_recalibration(max_horizon: int = MAX_HORIZON) -> dict[int, HistGradi
             targets, left_on=["element", "target_round"], right_on=["element", "round"],
             how="inner", suffixes=("", "_target"),
         )
+        if max_target_round is not None:
+            block = block[block["target_round"] <= max_target_round]
+        if len(block) < START_MODEL_MIN_ROWS:
+            continue
         y = (block["target_minutes"] >= 60).astype(int).values
         model = HistGradientBoostingClassifier(
             max_depth=3, min_samples_leaf=200, learning_rate=0.05, max_iter=200, l2_regularization=1.0,
@@ -474,8 +513,6 @@ def _fit_production_models():
     """
     from pipeline.features import feature_matrix
 
-    from pipeline.extra_seasons import premium_training_table, season_columns
-
     hist_df = load_processed("player_gameweek_2025_26")
     full_df = build_horizon_table(hist_df, target_min_minutes=0)
     X_full, _ = feature_matrix(full_df)
@@ -485,13 +522,7 @@ def _fit_production_models():
     # the start model stay on 25-26 only: premium-only seasons would skew a
     # population-level constant and a start model.
     train_60 = (full_df["target_minutes"] >= 60).values
-    premium = premium_training_table()
-    X_premium, _ = feature_matrix(premium)
-    X_train = pd.concat([
-        pd.concat([X_full[train_60], season_columns(full_df[train_60])], axis=1),
-        pd.concat([X_premium, season_columns(premium)], axis=1),
-    ], ignore_index=True).fillna(0.0)
-    y_train = pd.concat([full_df.loc[train_60, ["target_points"]], premium[["target_points"]]], ignore_index=True)
+    y_train, X_train = with_premium_seasons(full_df[train_60], X_full[train_60])
     res, train_cols = fit_production_glm(y_train, X_train)
     floor = fit_floor_mae_optimal(full_df, X_full, res)
     recalibrators = fit_p60_recalibration()
@@ -524,7 +555,14 @@ def fit_player_adjustments(res, train_cols) -> pd.Series:
     current = build_current_season_table()
     if current.empty:
         return pd.Series(dtype=float)
-    h1 = build_horizon_table(current, horizons=(1,))
+    return player_adjustments_from(build_horizon_table(current, horizons=(1,)), res, train_cols)
+
+
+def player_adjustments_from(h1: pd.DataFrame, res, train_cols) -> pd.Series:
+    """fit_player_adjustments' calculation on any table of one-week-ahead,
+    60+ minute rows (the backtest passes the games known by each week)."""
+    from pipeline.features import feature_matrix
+
     if h1.empty:
         return pd.Series(dtype=float)
     X, _ = feature_matrix(h1)

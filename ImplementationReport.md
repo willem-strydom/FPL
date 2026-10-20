@@ -127,7 +127,7 @@ Purged walk-forward, adjustments built only from games before each validation bl
 | **80 (chosen on folds 1-3)** | −0.0012 ± 0.0021 | +0.010 | **+0.09 ± 0.05** |
 | 160 | −0.0008 ± 0.0012 | +0.005 | +0.08 ± 0.03 |
 
-An additive version behaved the same. The gain is in the picks: about +0.1 realized points per top-3 pick for any k ≥ 40, with MAE unchanged. **It does not fix the premium over-prediction.** Haaland's one-week-ahead errors flip sign from block to block (+1.8, −4.5, +1.4, −3.9, +6.4, +3.7), so there's no stable trait to learn, and premium MAE gets slightly worse. Bruno, by contrast, was under-predicted in every block last season. Only this season's games are used, matching what was validated, so the adjustment is near zero early on (±2% at GW7) and grows through the season. Carrying last season's player effects into this one is untested.
+An additive version behaved the same. The gain is in the picks: about +0.1 realized points per top-3 pick for any k ≥ 40, with MAE unchanged. **It does not fix the premium over-prediction.** Haaland's one-week-ahead errors flip sign from block to block (+1.8, −4.5, +1.4, −3.9, +6.4, +3.7), so there's no stable trait to learn, and premium MAE gets slightly worse. Bruno, by contrast, was under-predicted in every block last season. Only this season's games are used, matching what was validated, so the adjustment is near zero early on (±2% at GW7) and grows through the season. Carrying last season's player effects into this one is untested. **Rechecked on the GLM with premium seasons (2026-10-19):** the gain shrinks to +0.04 ± 0.04 per pick at k = 80, MAE and RMSE about neutral; k = 80 is still best on folds 1-3, so it's kept. The premium seasons probably absorb part of what it was correcting.
 
 ### Calibration checks
 
@@ -204,7 +204,7 @@ Other features:
 - **Solver**: HiGHS, with identical plans to CBC at about 1.5-2× the speed.
 - **Owned-player guard**: the planner refuses to run if an owned player is missing from the pool; otherwise that player would be treated as sold for free.
 
-**Tuned settings**: horizon 8, decay 0.7, FT value 0.75, transfers allowed in the first 6 weeks (§8).
+**Tuned settings**: horizon 8, decay 0.85 (re-tuned 2026-10-19; was 0.7), FT value 0.75, transfers allowed in the first 6 weeks (§8).
 
 This dissolves the problem that sank the earlier policy work: the squad trajectory itself is a decision variable, so choices like "bank this week to make a free double transfer later" come out of the optimization instead of needing a hand-built rule.
 
@@ -215,7 +215,7 @@ This dissolves the problem that sank the earlier policy work: the squad trajecto
 ### The backtest harness (`policy_backtest.py`)
 
 The harness replays the 2025-26 season:
-- **Weekly refit**: at each decision week the model is refit only on outcomes known by then.
+- **Weekly refit**: at each decision week the model is refit only on outcomes known by then, mirroring production: GLM with the 2022-24 premium rows (all pre-season), player adjustment and start model from games known by that week.
 - **Decisions vs. scoring**: the policy decides using predicted points, and each week is scored on **realized** points (captain doubled, hits subtracted).
 - **Start**: the season begins from a fixed GW1 squad, chosen without the model by maximizing ownership within budget.
 
@@ -244,6 +244,8 @@ Decisions start at GW6, the first week with enough known outcomes to fit a model
 | Planner, 8 weeks, default settings | 1577 | 32 | +70 ± 22 (7/8 seeds) |
 | **Planner, tuned** | **1594** (seeds 0-7) | — | **+86 ± 32 (7/8 seeds)** |
 
+**Decay re-tuned (2026-10-19).** After the start model, premium seasons and player adjustment, decay was re-swept on 8 paired seeds with the backtest mirroring production. 0.85 is now a clear, bracketed peak (1654 mean): 0.6 −31, 0.7 (the old tuned value) −48 ± 15, 0.8 −21 ± 16, 0.9 −47 ± 24, 0.95 −67 ± 17. Better-calibrated start probabilities make the later weeks of the plan worth trusting more. It is also the community-standard value. FT value and transfer weeks were not re-swept (both were flat before). The original sweep is kept below for the record.
+
 **Tuning** — a coordinate-descent sweep with 16 seeds, taking the best mean at each stage (the tuned planner averaged 1597 over 16 seeds):
 
 | Parameter | Values (mean points) | Chosen |
@@ -268,14 +270,18 @@ The tuned set is +20 ± 14 over the defaults. Both the chosen decay and the chos
 - **Bench Boost**: the planned bench's points.
 - **Triple Captain**: the planned captain's points.
 
-Each chip is then placed exactly once in GW8-19, at most one per gameweek, maximizing total gain. A chip's threshold is its gain in its scheduled week. The one-chip-per-week rule moved at least one chip off its best week in all 8 seeds. Thresholds are assumed to hold for the second half, when a fresh set of chips arrives (GW20).
+Each chip is then placed exactly once in GW8-19, at most one per gameweek, maximizing total gain. A chip's threshold is its gain in its scheduled week. The one-chip-per-week rule moved at least one chip off its best week in all 8 seeds. Thresholds are assumed to hold for the second half, when a fresh set of chips arrives (GW20). The derivation is now in the repo (`python -m pipeline.chip_thresholds`) rather than a scratch script.
 
-| Chip | Threshold | Seed sd | Old (obsolete) |
-|---|---|---|---|
-| Wildcard | 18.7 | 1.7 | 21.15 |
-| Bench Boost | 14.0 | 0.6 | 14.24 |
-| Free Hit | 9.2 | 1.0 | 11.23 |
-| Triple Captain | 8.3 | 0.1 | 8.77 |
+Re-derived 2026-10-19, after the start model, the premium seasons, the player adjustment and the new planner decay (0.85) changed the predictions and the objective scale, and with the backtest now mirroring production:
+
+| Chip | Threshold | Seed sd | Previous | Original (obsolete) |
+|---|---|---|---|---|
+| Wildcard | **17.9** | 2.6 | 18.7 | 21.15 |
+| Bench Boost | **14.5** | 0.2 | 14.0 | 14.24 |
+| Free Hit | **8.1** | 0.7 | 9.2 | 11.23 |
+| Triple Captain | **8.2** | 0.0 | 8.3 | 8.77 |
+
+The wildcard gain is measured on the planner's decayed 8-week objective, so its threshold moves with the decay: at the old decay 0.7 the same re-derivation gave 15.1. Caveat on Bench Boost: it schedules in GW8 or GW9 (the weeks right after the trajectory's model-built starting squad, when the bench is freshly optimized); the best later week averages about 11.
 
 Three artifacts found and fixed in the first attempt:
 - starting from the ownership-based squad inflated the Wildcard (29.4);
@@ -338,13 +344,13 @@ python -m pipeline.recommend --refresh
 
 - **Mostly one season of history.** The GLM now also uses 2022-24 premium attackers (§3), but the floor, start model, policy comparisons and chip thresholds rest on 2025-26 alone, and the full 2024-25 season made predictions worse when added. The only held-out-season check is the season-ahead test in §3.
 - **Early-season calibration of the points model is untested** (validation starts at GW14) — the period where the largest expert disagreements occur. The start model has been checked early season (§5); the points model hasn't.
-- **Policy backtest uses the raw start rate**, not the start model, so backtested policies and chip thresholds predate both start-probability changes.
+- **The backtest has no RotoWire lineups**, so the next-week lineup carry-over isn't in it. Otherwise its weekly model mirrors production (since 2026-10-19): premium seasons, the player adjustment from games known by each week, and the start model refit weekly on known outcomes.
 - **Planner simplifications**:
   - Owned players are priced at their selling price in every week, so a sell-then-rebuy inside a plan is costed at the selling price.
   - The backtest uses a flat £100m budget at each week's prices.
   - There are no auto-substitutions.
 - **Chip simplifications**: playing a chip doesn't alter the simulated trajectory, and the second half is assumed to share the first half's thresholds.
-- **Tuning edges**: decay 0.7 and horizon 8 are both at the edges of their grids.
+- **Tuning edges**: horizon 8 is at the edge of its grid; decay is now bracketed (0.85). FT value and transfer weeks haven't been re-swept since the model changes.
 - **Not yet used**:
   - FPL's `chance_of_playing_next_round` (injury percentages)
   - Rolling window 8-10 (deferred)

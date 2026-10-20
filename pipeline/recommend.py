@@ -32,16 +32,20 @@ TEAM_FILE = Path(__file__).resolve().parent.parent / "my_team.json"
 BASE_COLS = ["code", "web_name", "team_name", "position_name", "price"]
 
 # Chip thresholds: the predicted gain a chip must offer before it's worth
-# playing. From the 25-26 first half on the tuned planner (8 seeds): per week,
+# playing, from `python -m pipeline.chip_thresholds` (25-26 first half on the
+# tuned planner, 8 seeds, backtest model mirroring production): per week,
 # WC = planner objective with vs without wildcard, FH = best one-week XI minus
 # the planned XI, BB = planned bench points, TC = planned captain points, all
 # on un-jittered predictions; then each chip placed once in GW8-19, at most one
 # per week, maximizing total gain; threshold = gain in its scheduled week
-# (seed sd: WC 1.7, FH 1.0, BB 0.6, TC 0.1). Assumed to hold for the second
-# half too. FPL gives a fresh set of chips from SECOND_HALF_START_GW.
+# (seed sd: WC 2.6, FH 0.7, BB 0.2, TC 0.0). Re-derived 2026-10-19 after the
+# start model, premium seasons, player adjustment and planner decay 0.85 (was
+# WC 18.7, FH 9.2, BB 14.0, TC 8.3; WC is on the decayed-objective scale, so it
+# moves with the decay). Assumed to hold for the second half too. FPL gives a fresh
+# set of chips from SECOND_HALF_START_GW.
 SECOND_HALF_START_GW = 20
 CHIP_LABELS = {"wildcard": "Wildcard", "freehit": "Free Hit", "bboost": "Bench Boost", "3xc": "Triple Captain"}
-CHIP_THRESHOLDS = {"wildcard": 18.7, "freehit": 9.2, "bboost": 14.0, "3xc": 8.3}
+CHIP_THRESHOLDS = {"wildcard": 17.9, "freehit": 8.1, "bboost": 14.5, "3xc": 8.2}
 
 
 def parse_entry_id(value: str) -> int:

@@ -365,8 +365,13 @@ MAX_BANKED_TRANSFERS = 5
 # weeks), +86 ± 32 over the old single-period production policy. Decay
 # 0.7-0.9 and every FT value tested were within noise of each other; decay
 # >= 0.95 and horizons < 8 were clearly worse. 0.7 is the lowest decay tried.
+# Decay re-swept 2026-10-19 after the start model, premium seasons and player
+# adjustment (8 paired seeds, backtest mirroring production): 0.85 is a clear
+# peak (1654 mean; 0.6 -31, 0.7 -48 ± 15, 0.8 -21 ± 16, 0.9 -47 ± 24,
+# 0.95 -67 ± 17). Better-calibrated start probabilities make the later weeks
+# worth trusting more. FT value and transfer weeks were not re-swept.
 PLANNER_HORIZON = 8
-PLANNER_DECAY = 0.7
+PLANNER_DECAY = 0.85
 PLANNER_FT_VALUE = 0.75
 PLANNER_TRANSFER_WEEKS = 6
 
