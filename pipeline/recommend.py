@@ -5,6 +5,7 @@ squad, plus the planner's wildcard squad.
     python -m pipeline.recommend --refresh  # pull fresh live + current-season data first
     python -m pipeline.recommend --entry 1234567   # any team, by FPL team id
     python -m pipeline.recommend --entry https://fantasy.premierleague.com/entry/1234567/event/6
+    python -m pipeline.recommend --keep "De Cuyper" --keep "Thomas (Coventry City)"   # never sell these
 
 Without --entry, my_team.json at the repo root says whose squad to plan for, either
     {"entry_id": 7592422}
@@ -90,6 +91,23 @@ def resolve_squad(names: list[str], players: pd.DataFrame) -> set:
     return codes
 
 
+def resolve_keep(names: list[str], players: pd.DataFrame, squad: set) -> set:
+    """--keep names -> codes, matched among the owned players only."""
+    if not names:
+        return set()
+    owned = players[players["code"].isin(squad)]
+    codes = set()
+    for raw in names:
+        name, _, team = raw.partition("(")
+        hits = owned[owned["web_name"].map(_norm) == _norm(name)]
+        if team:
+            hits = hits[hits["team_name"].map(_norm) == _norm(team.rstrip(")"))]
+        if len(hits) != 1:
+            raise ValueError(f"--keep '{raw}' matched {len(hits)} owned players; owned: {sorted(owned['web_name'])}")
+        codes.add(int(hits["code"].iloc[0]))
+    return codes
+
+
 def planning_pool(squad: set, players: pd.DataFrame, horizon: int) -> pd.DataFrame:
     horizons = tuple(range(1, horizon + 1))
     gw_cols = [f"predicted_points_gw{h}" for h in horizons]
@@ -169,6 +187,8 @@ def main() -> None:
     parser.add_argument("--team", type=Path, default=TEAM_FILE)
     parser.add_argument("--entry", type=parse_entry_id,
                         help="plan for any FPL team: team id or a link to the team (overrides --team)")
+    parser.add_argument("--keep", action="append", default=[], metavar="NAME",
+                        help="owned player the plan must not sell (FPL web name, '(Team)' if ambiguous); repeatable")
     args = parser.parse_args()
     logging.basicConfig(level=logging.WARNING)
 
@@ -199,8 +219,14 @@ def main() -> None:
     gw = get_next_gameweek()
     print(f"GW{gw} | {free_transfers} free transfer(s) | bank £{bank:.1f}m | budget £{rules['budget']:.1f}m")
 
-    normal = plan_transfers(pool, squad, free_transfers, horizon=PLANNER_HORIZON, rules=rules)
-    wild = plan_transfers(pool, squad, free_transfers, horizon=PLANNER_HORIZON, rules=rules, wildcard=True)
+    keep = resolve_keep(args.keep, players, squad)
+    normal = plan_transfers(pool, squad, free_transfers, horizon=PLANNER_HORIZON, rules=rules, keep=keep)
+    wild = plan_transfers(pool, squad, free_transfers, horizon=PLANNER_HORIZON, rules=rules, wildcard=True, keep=keep)
+    if keep:
+        free = plan_transfers(pool, squad, free_transfers, horizon=PLANNER_HORIZON, rules=rules)
+        names = ", ".join(players.set_index("code").loc[list(keep), "web_name"])
+        print(f"keeping {names}: plan objective {normal['objective']:.1f} vs {free['objective']:.1f} unrestricted "
+              f"(costs {free['objective'] - normal['objective']:.1f} decayed points over {PLANNER_HORIZON} weeks)")
     print_plan(normal, "Recommended transfers", gw)
     print_plan(wild, "Wildcard squad", gw)
     chip_report(pool, normal, wild, rules, chips_used, gw)

@@ -410,6 +410,7 @@ def plan_transfers(
     transfer_weeks: int | None = PLANNER_TRANSFER_WEEKS,
     rules: dict | None = None,
     wildcard: bool = False,
+    keep: set | None = None,
     top_n: int = 20,
     top_value_n: int = 10,
     cheapest_n: int = 5,
@@ -432,8 +433,14 @@ def plan_transfers(
 
     wildcard=True plays a wildcard in week 1: unlimited free transfers that
     week, banked FTs kept; later weeks follow normal rules.
+
+    keep: codes of owned players who must stay in the squad for the whole
+    horizon (a manual override; the plan is the best one around them).
     """
     rules = rules or load_squad_rules()
+    keep = set(keep or ())
+    if keep - set(current_squad_codes):
+        raise ValueError(f"can only keep owned players, not {sorted(keep - set(current_squad_codes))}")
     missing = set(current_squad_codes) - set(pool["code"])
     if missing:
         # An owned player absent from the pool would be treated as sold for free.
@@ -498,6 +505,9 @@ def plan_transfers(
             prob += hits[t] <= used - ft[t] + big_m * (1 - over[t])
             prob += ft[t + 1] == ft[t] - used + hits[t] + 1 - wasted[t]
 
+        for i in idx:
+            if pool.loc[i, "code"] in keep:
+                prob += squad[i][t] == 1
         prob += pulp.lpSum(squad[i][t] for i in idx) == rules["squad_size"]
         prob += pulp.lpSum(starter[i][t] for i in idx) == rules["starting_size"]
         prob += pulp.lpSum(captain[i][t] for i in idx) == 1
