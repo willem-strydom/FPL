@@ -111,9 +111,16 @@ class SeasonBacktest:
     def __init__(self, season_table: str = "player_gameweek_2025_26"):
         hist = load_processed(season_table)
         hist["kickoff_time"] = pd.to_datetime(hist["kickoff_time"])
+        from pipeline import availability
+
+        self.snapshots = availability.load("2025-26")
+        hist = availability.add_flags(hist, self.snapshots)
         self.hist = hist
 
         origin = _origin_snapshot(_add_trailing_features(hist))
+        origin = origin.merge(availability.origin_table(self.snapshots), on=["element", "round"], how="left")
+        origin["avail_now"] = origin["avail_now"].fillna(1.0)
+        origin["live_eligible"] = origin["live_eligible"].fillna(True).astype(bool)
         origin["price"] = origin["value"] / 10.0
         origin["position_name"] = origin["position"].map(POSITION_MAP)
         origin["team_name"] = origin["team"]
@@ -169,12 +176,15 @@ class SeasonBacktest:
         adjust = player_adjustments_from(self.horizon_df[h1_known], res, train_cols)
         quality = (quality + GLM_OFFSET) * np.exp(pool["code"].map(adjust).fillna(0.0).values) - GLM_OFFSET
 
-        start_models = fit_start_models(self.hist, max_target_round=r)
+        start_models = fit_start_models(self.hist, max_target_round=r, snapshots=self.snapshots)
         p60 = pool[START_RATE_COL].clip(0, 1).values.copy()
         for h, model in start_models.items():
             rows = (pool["horizon"] == h).values
             if rows.any():
                 p60[rows] = model.predict_proba(pool.loc[rows, START_MODEL_COLS].astype(float))[:, 1]
+        # Like the live pool, players flagged out at the deadline aren't scored:
+        # they keep their squad slot at no expected minutes.
+        p60 = np.where(pool["live_eligible"].values, p60, 0.0)
         pool = pool.assign(pp=p60 * quality + (1 - p60) * floor)
 
         # Blank weeks -> 0; double gameweeks -> sum of both fixtures.

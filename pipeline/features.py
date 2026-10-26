@@ -122,11 +122,18 @@ _PRUNED_FOR_COLLINEARITY = {
 # folds, gains mostly FWD/DEF — small but consistent.
 _STD_SOURCE_COLS = {
     "total_points": "std_points_per90",
-    "expected_goals": "std_xG_per90",
+    "expected_goals_capped": "std_xG_per90",
     "expected_assists": "std_xA_per90",
     "expected_goals_conceded": "std_xGA_per90",
     "points_ex_ga": "std_points_ex_ga_per90",
 }
+# Season xG is built from per-game xG capped at XG_GAME_CAP: 28.6% of all 25-26
+# xG came from single games of 0.7+ xG (penalties, big chances), lumps that
+# act as noise in a season rate and weakened xG's coefficient (0.095 -> 0.185
+# with the cap). Walk-forward: MAE neutral, RMSE -0.0006, £7.5m+ MAE -0.004,
+# top-3 per position +0.09 ± 0.05 realized points per pick. A cheap stand-in
+# for non-penalty xG, which FPL doesn't publish.
+XG_GAME_CAP = 0.7
 # std_points_per90 is still computed (it drives the std_unreliable flag) but
 # replaced in the GLM by std_points_ex_ga_per90 — see _PRUNED_FOR_COLLINEARITY.
 _STD_NOT_IN_MODEL = {"std_points_per90"}
@@ -150,7 +157,13 @@ START_RATE_NEW_GAME_WEIGHT = 1 - 0.5 ** (1 / START_RATE_HALFLIFE)
 # established starter). Walk-forward Brier vs the start rate alone: 0.1952 vs
 # 0.2045, better in 44/44 fold x horizon cells.
 START_PROFILE_WINDOW = 5
-START_MODEL_COLS = [START_RATE_COL, "mins_when_starting", "season_start_share"]
+START_MODEL_COLS = [START_RATE_COL, "mins_when_starting", "season_start_share", "avail_now"]
+# avail_now (pipeline.availability) is FPL's availability at the deadline:
+# 0 if injured/suspended, else chance of playing / 100. Added 2026-10-25 with
+# availability-aware history (games missed injured/suspended don't count as
+# non-starts) and training on live-eligible players only. Returners from an
+# absence: Brier 0.2137 -> 0.2005, next-week P(60+) 0.38 -> 0.50 (actual
+# 0.51); all live-eligible players: 0.1954 -> 0.1955 (tie).
 
 FEATURE_COLUMNS = [
     "horizon",
@@ -181,6 +194,7 @@ def _add_trailing_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
     # fill out the rest of a fixed 5-game window. Never applied to training.
     if "season_weight" not in df.columns:
         df["season_weight"] = 1.0
+    df["expected_goals_capped"] = df["expected_goals"].clip(upper=XG_GAME_CAP)
     df["points_ex_ga"] = (
         df["total_points"] - df["position"].map(GOAL_POINTS) * df["goals_scored"] - ASSIST_POINTS * df["assists"]
     )
@@ -229,15 +243,24 @@ def _add_trailing_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
         rate = grp[src].transform(lambda s: s.expanding().sum()) / df["cum_minutes_to_date"] * 90
         df[name] = rate.where(df["cum_minutes_to_date"] >= STD_MIN_MINUTES)
 
-    df[START_RATE_COL] = grp["starts"].transform(lambda s: s.ewm(halflife=START_RATE_HALFLIFE).mean())
-    started_minutes = df["minutes"].where(df["starts"] == 1)
+    # Start-model inputs. With availability flags (pipeline.availability), a
+    # game missed through a known injury or suspension doesn't count as a
+    # non-start, and a start cut short by injury doesn't count toward minutes
+    # when starting; without them every game counts.
+    excused = df["excused"].fillna(False).astype(bool) if "excused" in df else pd.Series(False, index=df.index)
+    shortened = df["injury_shortened"].fillna(False).astype(bool) if "injury_shortened" in df else pd.Series(False, index=df.index)
+    counted_starts = df["starts"].astype(float).where(~excused)
+    df[START_RATE_COL] = counted_starts.groupby(df["element"]).transform(
+        lambda s: s.ewm(halflife=START_RATE_HALFLIFE, ignore_na=True).mean()
+    ).fillna(0.0)
+    started_minutes = df["minutes"].where((df["starts"] == 1) & ~shortened)
     df["mins_when_starting"] = (
         started_minutes.groupby(df["element"])
         .transform(lambda s: s.dropna().rolling(START_PROFILE_WINDOW, min_periods=1).mean().reindex(s.index).ffill())
         .fillna(0.0)
         / 90
     )
-    df["season_start_share"] = grp["starts"].transform(lambda s: s.expanding().mean())
+    df["season_start_share"] = counted_starts.groupby(df["element"]).transform(lambda s: s.expanding().mean()).fillna(0.0)
 
     # Minutes-weighted (pooled), not a mean-of-per-match-rates: summing the raw
     # stat and the minutes separately over the window before dividing avoids a

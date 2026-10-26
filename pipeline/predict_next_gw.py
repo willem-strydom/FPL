@@ -171,7 +171,11 @@ def _load_blended_player_log() -> pd.DataFrame:
             "scoring before real current-season data exists is ever needed again."
         )
 
-    current = current.copy()
+    from pipeline import availability
+
+    # Games missed injured/suspended don't count as non-starts (see
+    # availability); flags use this season's FPL ids, so before aliasing.
+    current = availability.add_flags(current, availability.load("2026-27"))
     current["season_weight"] = 1.0
     current["element"] = current["code"]
 
@@ -272,6 +276,8 @@ def build_gw_feature_rows(target_event: int, horizon: int = 1) -> pd.DataFrame:
 
     pool = pool.merge(last_snap, on="code", how="inner", suffixes=("", "_hist"))
     pool = pool.merge(fixtures_by_team, left_on="team", right_index=True, how="inner")
+    from pipeline.availability import avail_now
+    pool["avail_now"] = avail_now(pool["status"], pool["chance_of_playing_next_round"])
 
     team_name = live_teams.set_index("id")["name"]
     pool["team_name"] = pool["team"].map(team_name)
@@ -456,8 +462,10 @@ def fit_p60_recalibration(max_horizon: int = MAX_HORIZON) -> dict[int, HistGradi
     interaction terms was close behind (0.1955). Monotone-increasing in all
     three inputs, so more starting can never lower the estimate.
     """
+    from pipeline import availability
+
     hist_df = load_processed("player_gameweek_2025_26")
-    return fit_start_models(hist_df, max_horizon=max_horizon)
+    return fit_start_models(hist_df, max_horizon=max_horizon, snapshots=availability.load("2025-26"))
 
 
 START_MODEL_MIN_ROWS = 2000
@@ -465,16 +473,30 @@ START_MODEL_MIN_ROWS = 2000
 
 def fit_start_models(
     hist_df: pd.DataFrame, max_horizon: int = MAX_HORIZON, max_target_round: int | None = None,
+    snapshots: pd.DataFrame | None = None,
 ) -> dict[int, HistGradientBoostingClassifier]:
     """The per-horizon start models of fit_p60_recalibration, fit on one
     season's player log. `max_target_round` keeps only outcomes known by that
     round (the season backtest refits weekly with it); a horizon with fewer
     than START_MODEL_MIN_ROWS rows is skipped, and callers fall back to the
-    raw start rate for it."""
+    raw start rate for it.
+
+    With availability `snapshots` (pipeline.availability), games missed
+    injured or suspended don't count as non-starts, availability at the
+    origin is an input, and only live-eligible origins (available, or
+    doubtful at 75%+, the live pool's bar) are trained on."""
+    from pipeline import availability
+
+    if snapshots is not None:
+        hist_df = availability.add_flags(hist_df, snapshots)
     df2 = _add_trailing_features(hist_df)
     origin = _origin_snapshot(df2)
     origin = origin[origin["round"] >= MIN_ORIGIN_ROUND]
     origin = origin[origin["trail_games5"] > 0]
+    if snapshots is not None:
+        origin = origin.merge(availability.origin_table(snapshots), on=["element", "round"], how="left")
+        origin = origin[origin["live_eligible"].fillna(True).astype(bool)]
+    origin["avail_now"] = origin["avail_now"].fillna(1.0) if "avail_now" in origin else 1.0
     origin[START_RATE_COL] = origin[START_RATE_COL].clip(0, 1)
     targets = hist_df.groupby(["element", "round"], as_index=False).agg(target_minutes=("minutes", "sum"))
 

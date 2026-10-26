@@ -61,6 +61,15 @@ A VIF diagnosis found the attacking-output cluster (points, goals, BPS, ICT per 
 
 The GW6-9 column is a leave-one-block-out check with near-full training data. It shows the full swap's bigger overall gain is a mid-season effect: over a handful of games actual goals are mostly finishing noise, xG settles faster, and the swap only starts to win around GW10. The adopted version keeps xG/xA for the season-long read, uses actual goals/assists for recent form, has max VIF 3.0 and every attacking coefficient positive. The full swap is a candidate to revisit mid-season.
 
+**Capped per-game xG (2026-10-25).** The GLM weighted season xA about 2.3× more than season xG, which looks backwards since a goal is worth more than an assist. It isn't a bug:
+- **Price absorbs xG.** FPL prices attackers largely on goal threat (correlation 0.64). Adding price cuts xG's weight from 0.34 to 0.11, but xA's only from 0.47 to 0.32.
+- **Only attackers are inverted.** For defenders xG outweighs xA (0.41 vs 0.22), as you'd expect.
+- **xA predicts more than assists.** Per 1.0 of season xA per 90, the next game brings +1.68 assist points, +0.86 bonus and +0.53 goal points.
+- **xA persists slightly better:** 0.74 vs 0.67.
+- **xG is lumpy.** 28.6% of all xG comes from single games of 0.7+ xG (penalties, big chances), and that noise weakens its coefficient.
+
+Season xG is now built from per-game xG capped at 0.7, a cheap stand-in for non-penalty xG. The production weights move to xG 0.21 and xA 0.27. Walk-forward: MAE neutral, RMSE −0.0006, £7.5m+ MAE −0.004, top-3 +0.09 ± 0.05 per pick (borderline, adopted on the principle).
+
 ### Leakage-safe validation
 
 Horizon-as-feature creates near-duplicate rows, so all validation is **walk-forward, expanding-window CV grouped by (player, origin gameweek)**. A further leak was found when extending to 8 horizons: folds split on the *origin* round only, so a training row from origin 13, horizon 4 had its target in the next validation block. Training rows are now **purged** unless their target round precedes the validation block. The leak turned out to be worth only ~0.002 MAE at horizons 1-4, so earlier conclusions stand, but it would have grown with longer horizons.
@@ -174,6 +183,13 @@ How it got there:
   | One missed game, 85+ min when starting | 0.84 | 0.69 | 0.86 |
 
   Minutes when starting also stands in for "absent through injury" vs "dropped", which the archive can't record directly. The three-input model beat the one-input recalibration in **44 of 44** fold × horizon cells (Brier 0.1952 vs 0.2045); a logistic model with interaction terms was a close second (0.1955). Trained on GW18+ only and tested on GW4-9, it was well calibrated next week (most nailed bin: predicted 0.94, actual 0.94) and slightly optimistic further out (0.90 vs 0.87 at four weeks). Even fully nailed players only reach 60+ minutes about 89% of the time next week and 77% eight weeks out (injuries, suspensions, rotation, early subs), so p(60+) sits well below managers' "90%+ to start".
+- **Availability-aware (2026-10-25).** FPL-Core-Insights' per-gameweek snapshots of FPL's own status (`pipeline/availability.py`; each taken after the week's games, so it's what managers knew at the next deadline) let the model tell injury and suspension absences from being dropped:
+  - games missed while flagged injured or suspended (or at 25% or less) don't count as non-starts;
+  - starts under 60 minutes followed by an injury flag don't count toward minutes when starting;
+  - **current availability** (0 if out, else chance of playing / 100) is a fourth input;
+  - the model trains only on players the live pool would score (available, or doubtful at 75%+).
+
+  Excusing absences *alone* made things worse (Brier 0.1952 → 0.1990), because it hid players who were still injured. Paired with current availability it fixes returning players: for those with an excused absence in the last 5 weeks, Brier 0.2137 → 0.2005 and next-week P(60+) 0.38 → 0.50 against 0.51 actual. Overall it ties (0.1954 vs 0.1955), being slightly optimistic 8 weeks out. A doubtful-75% player is now marked down for weeks 2-8 too, not just next week.
 - **Lineup carry-over**: archive validation with the actual next start flipped 10% of the time (RotoWire's measured error): weeks 2-8 Brier 0.2000 → 0.1954 on top of the new model, better in 31/38 cells. Combined with the new model: 0.2099 → 0.1954.
 - A RotoWire double-fixture bug (a rearranged match live alongside next week's preview gave some players two rows) is resolved by matching on player *and* opponent. The same opponent matching now decides whether a team "has a lineup": mid-gameweek, RotoWire still shows the current round's lineups for teams yet to play, which would otherwise have marked all their players as benched for the next round.
 

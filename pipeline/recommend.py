@@ -186,9 +186,10 @@ def main() -> None:
     logging.basicConfig(level=logging.WARNING)
 
     if args.refresh:
-        from pipeline import fpl_current_season, fpl_live
+        from pipeline import availability, fpl_current_season, fpl_live
         fpl_live.ingest()
         fpl_current_season.ingest()
+        availability.load("2026-27", refresh=True)
 
     team = {"entry_id": args.entry} if args.entry is not None else json.loads(args.team.read_text())
     players = live_player_table()
