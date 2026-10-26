@@ -264,20 +264,41 @@ What the sweep showed:
 
 The tuned set is +20 ± 14 over the defaults. Both the chosen decay and the chosen horizon sit at the edge of their grids, so neither optimum is bracketed yet.
 
-### Chip thresholds
+### Chip timing (optimal stopping, adopted 2026-10-25)
 
-**How they're derived**: first half of 2025-26, 8 seeds, along the tuned planner's trajectory. Gains are measured each week on un-jittered predictions:
-- **Wildcard**: planner objective with the chip minus without.
-- **Free Hit**: best one-week XI minus the planned XI.
-- **Bench Boost**: the planned bench's points.
-- **Triple Captain**: the planned captain's points.
+**Earlier approach (superseded):** fixed thresholds from a hindsight schedule. Each chip was placed in its best week of GW8-19 after seeing the whole half, and its threshold was the gain in that week (last values: WC 17.9, FH 8.1, BB 14.5, TC 8.2). That assumes perfect hindsight, so the thresholds were biased upward, and they ignored how many weeks were left.
 
-Each chip is then placed exactly once in GW8-19, at most one per gameweek, maximizing total gain. A chip's threshold is its gain in its scheduled week. The one-chip-per-week rule moved at least one chip off its best week in all 8 seeds. Thresholds are assumed to hold for the second half, when a fresh set of chips arrives (GW20). The derivation is now in the repo (`python -m pipeline.chip_thresholds`) rather than a scratch script.
+**Now (`pipeline/chip_policy.py`):** chips are an optimal-stopping problem. Each half's chips expire at its deadline (GW19, then GW38), and only one can be played per gameweek. With a set S of unused chips, the value of holding them is computed backwards from the deadline:
 
-Re-derived 2026-10-19, after the start model, the premium seasons, the player adjustment and the new planner decay (0.85) changed the predictions and the objective scale, and with the backtest now mirroring production:
+```
+V(after deadline, S) = 0
+V(week j, S) = E[ max( V(j+1, S), max over c in S of gain_c(j) + V(j+1, S − c) ) ]
+```
 
-| Chip | Threshold | Seed sd | Previous | Original (obsolete) |
+The rule: play the chip with the largest gain − (V(next, S) − V(next, S − c)) if that is positive. The threshold, i.e. the value of keeping the chip, falls as the deadline nears and depends on which other chips are still held.
+
+**Future weeks' gains.** For the next 8 weeks, Bench Boost and Triple Captain use the planner's own forecast for that week (planned bench and captain points, so known double gameweeks count), plus a forecast error drawn from the backtest at the same lead time. Error sd is about 2.3 points for bench and 0.7-1.6 for captain. Everything else is a joint draw of all four chips' weekly gains from the 2025-26 backtest (248 draws: 8 seeds × GW8-38, start week excluded), which keeps the correlation between chips. Gains are measured as before: clean predictions, along the tuned planner's jittered trajectory, from a model-built starting squad.
+
+| Weeks left in the half (all four chips held, no forecasts) | Wildcard | Free Hit | Bench Boost | Triple Captain |
 |---|---|---|---|---|
+| 19 | 19.8 | 10.7 | 13.7 | 9.6 |
+| 11 | 17.1 | 8.8 | 13.1 | 8.5 |
+| 8 | 15.6 | 7.9 | 12.6 | 7.9 |
+| 6 | 14.2 | 7.1 | 12.0 | 7.4 |
+| 4 | 7.3 | 0.9 | 6.1 | 1.6 |
+| 2 | 1.9 | 0.1 | 1.8 | 0.0 |
+
+The sharp fall from 6 to 4 weeks is the chips crowding each other: with all four held, they need four of the last few gameweeks. Live thresholds differ from this table because they use the squad's own bench and captain forecasts; at GW9, for example, the value of keeping Bench Boost was 11.8 rather than 13.1, because this squad's bench projects weak.
+
+**Limitations:**
+- One season of gains, so the rare huge weeks are thinly sampled.
+- Gains are treated as independent from week to week beyond the forecast window.
+- Playing a chip doesn't change the simulated trajectory.
+- The policy hasn't been compared with the old thresholds on realized points.
+
+Earlier artifacts in measuring chip gains, all handled: an ownership-built starting squad inflated the Wildcard (29.4); measuring gains on jittered predictions let Wildcard and Free Hit cherry-pick lucky noise; the model-built starting week itself inflated Bench Boost.
+
+---|---|---|---|---|
 | Wildcard | **17.9** | 2.6 | 18.7 | 21.15 |
 | Bench Boost | **14.5** | 0.2 | 14.0 | 14.24 |
 | Free Hit | **8.1** | 0.7 | 9.2 | 11.23 |
@@ -326,19 +347,18 @@ python -m pipeline.recommend --refresh
 3. Fit the GLM, floor and start-probability model on the complete 2025-26 season; build current-season features from played fixtures only; fetch RotoWire lineups.
 4. Score every eligible player for the next 8 gameweeks (blank weeks → 0, double gameweeks summed), add enablers, keep owned players at selling price.
 5. Solve the planner for transfers and for a wildcard squad; print the XI, captain, bench and week-by-week plan.
-6. Compare each chip's current gain to its threshold, check which chips remain in the current half, and recommend at most one.
+6. For each chip still held this half, compare this week's gain with the value of keeping it (`chip_policy`, from weeks left, the other chips held and the squad's bench and captain forecasts), and recommend at most one.
 
 `SquadHistory.md` is the human-readable transfer log, refreshed from the API (the API is the source of truth — the hand-kept record once assumed a GW5 transfer that was never made).
 
 **GW6 (made)**: Szoboszlai and Anderson out, Ødegaard and Rudoni in, as recommended; £1.5m left in the bank.
 
-**GW7 (made)**: no transfer; the free transfer was rolled (the planner's Ødegaard → Semenyo was worth almost nothing either way).
+**GW7 (made)**: no transfer; the free transfer was rolled. **GW8 (made)**: Dubravka → Kinsky.
 
-**Current state (GW8)**: 2 free transfers, £1.5m in the bank, £99.1m budget at selling prices.
-- **Recommended**: De Cuyper out, Murillo in, keeping the second transfer; captain B.Fernandes.
-- **Haaland** is projected only 4.2 because of injury doubt (FPL 75%, RotoWire "questionable", so p(60+) 0.54); his points given 60+ minutes is still 7.8.
-- **Planner's later moves**: Van Hecke and Tonali (GW9), Hill (GW10), Verbruggen (GW11).
-- **Chips**: none clear their thresholds (Wildcard 8.7 against 18.7).
+**Current state (GW9)**: 2 free transfers, £1.0m in the bank, £99.1m budget at selling prices.
+- **Recommended**: Calafiori (hip doubt, 75%) and van Ewijk out, Hill and Van Hecke in; captain Haaland.
+- **Planner's later moves**: B.Fernandes → Rogers (GW10), then Thiago, Muharemović and Silva.
+- **Chips** (11 weeks left in the half): none beat the value of keeping them. The wildcard is closest: gain 15.2 against 17.1.
 
 ---
 

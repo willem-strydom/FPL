@@ -538,6 +538,9 @@ def plan_transfers(
             "hits": val(hits[t]),
             "xi_points": float(sum(pred[i][t] * (val(starter[i][t]) + val(captain[i][t])) for i in idx)),
             "starters": pool.loc[[i for i in idx if val(starter[i][t])], "web_name"].tolist(),
+            # what a Triple Captain / Bench Boost would add that week (chip_policy)
+            "captain_points": float(sum(pred[i][t] * val(captain[i][t]) for i in idx)),
+            "bench_points": float(sum(pred[i][t] * (val(squad[i][t]) - val(starter[i][t])) for i in idx)),
         })
 
     pool["in_squad"] = [bool(val(squad[i][0])) for i in idx]

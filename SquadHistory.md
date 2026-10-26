@@ -22,6 +22,7 @@ yet visible (upcoming-gameweek transfers stay hidden until the deadline).
 | 5 | 2026-09-18 | none | none | 0 | CONFIRMED (API) — the recommended De Cuyper → Hall was not made; FT rolled |
 | 6 | 2026-10-10 | Szoboszlai, Anderson | Ødegaard, Rudoni | 2 | CONFIRMED (API) — the planner's recommendation, no hit |
 | 7 | 2026-10-17 | none | none | 0 | CONFIRMED (API) — FT rolled (the planner had Ødegaard → Semenyo as a near-zero-value move); captain Haaland |
+| 8 | 2026-10-23 | Dubravka | Kinsky | 1 | CONFIRMED (API) — the planner's recommendation; second FT rolled |
 
 ---
 

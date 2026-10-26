@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from pipeline.chip_policy import HALF_DEADLINES, deadline_for, decide
 from pipeline.fpl_entry import fetch_entry_state
 from pipeline.optimizer import PLANNER_HORIZON, load_squad_rules, plan_transfers, select_squad
 from pipeline.predict_next_gw import POSITION_NAME, build_enabler_candidates, get_next_gameweek, predict_multi_gw
@@ -32,21 +33,10 @@ from pipeline.storage import load_raw
 TEAM_FILE = Path(__file__).resolve().parent.parent / "my_team.json"
 BASE_COLS = ["code", "web_name", "team_name", "position_name", "price"]
 
-# Chip thresholds: the predicted gain a chip must offer before it's worth
-# playing, from `python -m pipeline.chip_thresholds` (25-26 first half on the
-# tuned planner, 8 seeds, backtest model mirroring production): per week,
-# WC = planner objective with vs without wildcard, FH = best one-week XI minus
-# the planned XI, BB = planned bench points, TC = planned captain points, all
-# on un-jittered predictions; then each chip placed once in GW8-19, at most one
-# per week, maximizing total gain; threshold = gain in its scheduled week
-# (seed sd: WC 2.6, FH 0.7, BB 0.2, TC 0.0). Re-derived 2026-10-19 after the
-# start model, premium seasons, player adjustment and planner decay 0.85 (was
-# WC 18.7, FH 9.2, BB 14.0, TC 8.3; WC is on the decayed-objective scale, so it
-# moves with the decay). Assumed to hold for the second half too. FPL gives a fresh
-# set of chips from SECOND_HALF_START_GW.
-SECOND_HALF_START_GW = 20
+# Chip timing: optimal stopping over the chips still held this half (see
+# chip_policy). Each chip is played only if this week's gain beats the value
+# of keeping it, which falls as the half's deadline nears.
 CHIP_LABELS = {"wildcard": "Wildcard", "freehit": "Free Hit", "bboost": "Bench Boost", "3xc": "Triple Captain"}
-CHIP_THRESHOLDS = {"wildcard": 17.9, "freehit": 8.1, "bboost": 14.5, "3xc": 8.2}
 
 
 def parse_entry_id(value: str) -> int:
@@ -155,30 +145,33 @@ def print_plan(res: dict, title: str, first_gw: int) -> None:
 
 
 def chip_report(pool: pd.DataFrame, normal: dict, wild: dict, rules: dict, chips_used: dict, gw: int) -> None:
-    """Each chip's predicted gain this week vs its threshold; recommend at most
-    one (FPL allows one chip per gameweek), only from this half's unused set."""
+    """Each held chip's gain this week vs the value of keeping it (chip_policy);
+    recommend at most one, since FPL allows one chip per gameweek."""
     free_hit = select_squad(pool.assign(predicted_points=pool["predicted_points_gw1"]), rules=rules)
     gains = {
         "wildcard": wild["objective"] - normal["objective"],
         "freehit": free_hit["starting_predicted_points"] - normal["plan"][0]["xi_points"],
-        "bboost": float(normal["bench"]["predicted_points"].sum()),
-        "3xc": float(normal["captain"]["predicted_points"]),
+        "bboost": normal["plan"][0]["bench_points"],
+        "3xc": normal["plan"][0]["captain_points"],
     }
-    half = range(1, SECOND_HALF_START_GW) if gw < SECOND_HALF_START_GW else range(SECOND_HALF_START_GW, 39)
-    used = {name for event, name in chips_used.items() if event in half}
+    forecasts = {"bboost": [wk["bench_points"] for wk in normal["plan"]],
+                 "3xc": [wk["captain_points"] for wk in normal["plan"]]}
+    deadline = deadline_for(gw)
+    half_start = 1 if deadline == HALF_DEADLINES[0] else HALF_DEADLINES[0] + 1
+    used = {name for event, name in chips_used.items() if half_start <= event <= deadline}
+    result = decide(gains, gw, set(CHIP_LABELS) - used, forecasts)
 
-    print(f"\n=== Chips (GW{gw}) ===")
-    candidates = []
+    print(f"\n=== Chips (GW{gw}, {result['weeks_left']} week(s) left before the GW{deadline} deadline) ===")
     for chip, label in CHIP_LABELS.items():
-        status = "used this half" if chip in used else "available"
-        margin = gains[chip] - CHIP_THRESHOLDS[chip]
-        if chip not in used and margin >= 0:
-            candidates.append((margin, label))
-        print(f"  {label:15s} gain {gains[chip]:5.1f} vs threshold {CHIP_THRESHOLDS[chip]:5.1f} ({status})")
-    if candidates:
-        print(f"  -> play {max(candidates)[1]} this week")
+        if chip in used:
+            print(f"  {label:15s} used this half")
+            continue
+        r = result["chips"][chip]
+        print(f"  {label:15s} gain {r['gain']:5.1f} vs value of keeping it {r['threshold']:5.1f} (margin {r['margin']:+.1f})")
+    if result["play"]:
+        print(f"  -> play {CHIP_LABELS[result['play']]} this week")
     else:
-        print("  -> no chip clears its threshold this week")
+        print("  -> no chip beats the value of keeping it this week")
 
 
 def main() -> None:
