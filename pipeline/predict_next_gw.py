@@ -825,9 +825,12 @@ def build_enabler_candidates(
     if not probs.empty:
         candidates = candidates.merge(probs[["code", "p_plays_60_lineup"]], on="code", how="left")
     else:
-        candidates["p_plays_60_lineup"] = pd.NA
+        # np.nan, not pd.NA: pd.NA makes the column object-typed, and those
+        # points then break the planner's sorting (hit when RotoWire had no
+        # lineups posted yet).
+        candidates["p_plays_60_lineup"] = np.nan
     candidates["confirmed_starter"] = candidates["p_plays_60_lineup"].notna()
-    candidates["p_plays_60_lineup"] = candidates["p_plays_60_lineup"].fillna(BENCH_PROB)
+    candidates["p_plays_60_lineup"] = candidates["p_plays_60_lineup"].fillna(BENCH_PROB).astype(float)
 
     weight_sum = sum(discount ** (h - 1) for h in horizons)
     candidates["predicted_points"] = (
